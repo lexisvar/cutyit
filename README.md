@@ -8,7 +8,7 @@ The subtitle editor has a live preview that updates as you type, word-level anim
 
 ## Download
 
-Grab the latest `.dmg` from [Releases](https://github.com/lexisvar/cutyvideo/releases), drag Cutyit to Applications, and open it. The first run will ask for permission to open an app from the internet — that's standard Gatekeeper behavior.
+Grab the latest `.dmg` from [Releases](https://github.com/lexisvar/cutyit/releases), drag Cutyit to Applications, and open it. The first run will ask for permission to open an app from the internet — that's standard Gatekeeper behavior.
 
 ---
 
@@ -49,8 +49,8 @@ Eight built-in presets (TikTok, Reels, YouTube, Neon, Impact, Minimal, Instagram
 You'll need Python 3.10+ and FFmpeg installed (`brew install ffmpeg`).
 
 ```bash
-git clone git@github.com:lexisvar/cutyvideo.git
-cd cutyvideo
+git clone git@github.com:lexisvar/cutyit.git
+cd cutyit
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt

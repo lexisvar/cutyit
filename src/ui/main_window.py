@@ -223,7 +223,7 @@ class MainWindow(QMainWindow):
         self._tabs.setMinimumWidth(270)
         self._tabs.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
 
-        self._tabs.addTab(self._build_split_tab(), "✂ Edit")
+        self._tabs.addTab(self._build_split_tab(), "✂ Clips")
         self.subtitle_editor = SubtitleEditorWidget()
         _sub_scroll = QScrollArea()
         _sub_scroll.setWidgetResizable(True)
@@ -260,9 +260,9 @@ class MainWindow(QMainWindow):
         lay.setSpacing(5)
 
         # ── Split at playhead ─────────────────────────────────────────── #
-        self._btn_add_split = QPushButton("＋  Split at Current Position")
+        self._btn_add_split = QPushButton("✂  Cut Here")
         self._btn_add_split.setObjectName("btn_primary")
-        self._btn_add_split.setToolTip("Add a cut point at the playhead  (S)")
+        self._btn_add_split.setToolTip("Add a cut at the playhead position  (S)")
         self._btn_add_split.setEnabled(False)
         self._btn_add_split.setFixedHeight(28)
         lay.addWidget(self._btn_add_split)
@@ -284,19 +284,19 @@ class MainWindow(QMainWindow):
         self._btn_auto_split = QPushButton("⏱")
         self._btn_auto_split.setEnabled(False)
         self._btn_auto_split.setFixedSize(26, 26)
-        self._btn_auto_split.setToolTip("Auto-split at regular intervals")
+        self._btn_auto_split.setToolTip("Auto-cut at regular intervals")
         auto_row.addWidget(self._btn_auto_split)
         self._btn_silence = QPushButton("🔇")
         self._btn_silence.setEnabled(False)
         self._btn_silence.setFixedSize(26, 26)
         self._btn_silence.setToolTip(
-            "Detect silences and auto-add split points at their midpoints"
+            "Detect silences and auto-add cut points at their midpoints"
         )
         auto_row.addWidget(self._btn_silence)
         lay.addLayout(auto_row)
 
-        # ── Segments list ─────────────────────────────────────────────── #
-        hdr = QLabel("SEGMENTS")
+        # ── Clips list ────────────────────────────────────────────────── #
+        hdr = QLabel("CLIPS")
         hdr.setObjectName("section_header")
         lay.addWidget(hdr)
 
@@ -308,11 +308,11 @@ class MainWindow(QMainWindow):
         # ── Remove / Export row ───────────────────────────────────────── #
         btn_row = QHBoxLayout()
         btn_row.setSpacing(5)
-        self._btn_del_split = QPushButton("✕ Remove")
+        self._btn_del_split = QPushButton("✕ Remove Cut")
         self._btn_del_split.setEnabled(False)
         self._btn_del_split.setFixedHeight(26)
         btn_row.addWidget(self._btn_del_split)
-        self._btn_export = QPushButton("⬇ Export Segments…")
+        self._btn_export = QPushButton("⬇ Export Clips…")
         self._btn_export.setObjectName("btn_primary")
         self._btn_export.setEnabled(False)
         self._btn_export.setFixedHeight(26)
@@ -361,7 +361,7 @@ class MainWindow(QMainWindow):
 
         tb.addSeparator()
 
-        self._act_export = QAction(" Export Segments… ", self)
+        self._act_export = QAction(" Export Clips… ", self)
         self._act_export.setEnabled(False)
         self._act_export.triggered.connect(self._export_segments)
         tb.addAction(self._act_export)
@@ -470,7 +470,7 @@ class MainWindow(QMainWindow):
 
     def _update_split_btn(self, ms: int) -> None:
         if self._video_path:
-            self._btn_add_split.setText(f"＋ Split at {_fmt(ms)}")
+            self._btn_add_split.setText(f"✂  Cut at {_fmt(ms)}")
 
     # ------------------------------------------------------------------ #
     #  Slots — split management                                            #
@@ -501,7 +501,7 @@ class MainWindow(QMainWindow):
         if added:
             self._refresh_split_list()
         self._status.showMessage(
-            f"Added {added} split point(s) every {self._split_interval_sp.value()}s"
+            f"Added {added} cut point(s) every {self._split_interval_sp.value()}s"
         )
 
     def _remove_selected_split(self) -> None:
@@ -527,9 +527,9 @@ class MainWindow(QMainWindow):
             s, e = boundaries[i], boundaries[i + 1]
             dur_label = _fmt_dur(e - s)
             self._split_list.addItem(
-                f"  Segment {i + 1}   {_fmt(s)} → {_fmt(e)}  ·  {dur_label}"
+                f"  Clip {i + 1}   {_fmt(s)} → {_fmt(e)}  ·  {dur_label}"
             )
-            segs_info.append((s, e, f"Segment {i + 1}  ({_fmt(s)} – {_fmt(e)})"))
+            segs_info.append((s, e, f"Clip {i + 1}  ({_fmt(s)} – {_fmt(e)})"))
         n = len(boundaries) - 1
         self._lbl_seg_count.setText(f"{n} seg{'s' if n != 1 else ''}")
         self._btn_del_split.setEnabled(False)
@@ -565,6 +565,17 @@ class MainWindow(QMainWindow):
         )
         if not path:
             return
+
+        # Terminate any running background workers so the UI cannot lock up
+        for _w in (self._sub_worker, self._split_worker,
+                   self._social_worker, self._silence_worker):
+            if _w is not None and _w.isRunning():
+                _w.terminate()
+                _w.wait(3000)
+        self._export_progress.hide()
+        self._set_export_busy(False)
+        self._btn_social.setEnabled(False)
+        self._btn_silence.setEnabled(False)
 
         self._video_path = path
         self.player.load(path)
@@ -619,11 +630,11 @@ class MainWindow(QMainWindow):
 
     def _on_split_done(self, paths: list) -> None:
         self._set_export_busy(False)
-        self._status.showMessage(f"Exported {len(paths)} segment(s)")
+        self._status.showMessage(f"Exported {len(paths)} clip(s)")
         QMessageBox.information(
             self,
             "Export Complete",
-            f"Saved {len(paths)} segment(s):\n" + "\n".join(os.path.basename(p) for p in paths),
+            f"Saved {len(paths)} clip(s):\n" + "\n".join(os.path.basename(p) for p in paths),
         )
 
     def _on_split_error(self, msg: str) -> None:
@@ -763,7 +774,7 @@ class MainWindow(QMainWindow):
         if added:
             self._refresh_split_list()
         self._status.showMessage(
-            f"Found {len(silences)} silent region(s) \u2014 added {added} split point(s)"
+            f"Found {len(silences)} silent region(s) — added {added} cut point(s)"
         )
 
     def _on_silences_error(self, msg: str) -> None:

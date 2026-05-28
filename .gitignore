@@ -1,0 +1,54 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+*.egg
+dist/
+build/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# PyInstaller
+*.spec.bak
+*.manifest
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+*.dmg
+*.pkg
+Icon?
+._*
+.Spotlight-V100
+.Trashes
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Environment / secrets
+.env
+.env.local
+
+# Whisper model cache (downloaded at runtime)
+# ~/.cache/huggingface/ is outside the project — nothing to ignore here
+
+# Test/temp outputs
+*.srt
+*.vtt
+*.ass
+tmp_*.wav
+
+# Assets source files (keep .icns and .png, exclude raw iconset)
+assets/icon.iconset/

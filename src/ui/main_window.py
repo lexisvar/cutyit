@@ -1,0 +1,951 @@
+import os
+
+from PyQt6.QtWidgets import (
+    QMainWindow, QWidget, QSplitter, QVBoxLayout, QHBoxLayout,
+    QToolBar, QFileDialog, QMessageBox, QListWidget, QComboBox,
+    QPushButton, QLabel, QTabWidget, QStatusBar, QSizePolicy, QFrame,
+    QSpinBox, QProgressBar, QScrollArea,
+)
+from PyQt6.QtCore import Qt, QThread, QDir, pyqtSignal
+from PyQt6.QtGui import QAction, QKeySequence, QShortcut
+
+from src.ui.subtitle_overlay import SubtitleOverlayPlayer
+from src.ui.timeline import TimelineWidget
+from src.ui.subtitle_editor import SubtitleEditorWidget
+
+
+# --------------------------------------------------------------------------- #
+#  Background workers                                                          #
+# --------------------------------------------------------------------------- #
+
+class _SplitWorker(QThread):
+    progress = pyqtSignal(str)
+    finished = pyqtSignal(list)   # output paths
+    error = pyqtSignal(str)
+
+    def __init__(self, input_path: str, splits: list[int], output_dir: str) -> None:
+        super().__init__()
+        self._input = input_path
+        self._splits = splits
+        self._out_dir = output_dir
+
+    def run(self) -> None:
+        try:
+            from src.core.video_processor import split_video  # noqa: PLC0415
+            base = os.path.splitext(os.path.basename(self._input))[0]
+            self.progress.emit("Splitting…")
+            paths = split_video(self._input, self._splits, self._out_dir, base)
+            self.finished.emit(paths)
+        except Exception as exc:
+            self.error.emit(str(exc))
+
+
+class _SubExportWorker(QThread):
+    finished = pyqtSignal(str)
+    error = pyqtSignal(str)
+    progress = pyqtSignal(int)   # 0-100
+
+    def __init__(
+        self,
+        input_path: str,
+        srt_path: str,
+        output_path: str,
+        burn_in: bool,
+        start_ms: int = 0,
+        end_ms: int = -1,
+    ) -> None:
+        super().__init__()
+        self._input = input_path
+        self._srt = srt_path
+        self._output = output_path
+        self._burn_in = burn_in
+        self._start_s = start_ms / 1000.0
+        self._end_s = end_ms / 1000.0 if end_ms >= 0 else None
+
+    def run(self) -> None:
+        try:
+            if self._burn_in and self._srt.endswith(".ass"):
+                from src.core.video_processor import burn_ass_subtitles  # noqa: PLC0415
+                burn_ass_subtitles(
+                    self._input, self._srt, self._output,
+                    start_s=self._start_s, end_s=self._end_s,
+                    on_progress=self.progress.emit,
+                )
+            else:
+                from src.core.video_processor import add_subtitles  # noqa: PLC0415
+                add_subtitles(
+                    self._input, self._srt, self._output, self._burn_in,
+                    start_s=self._start_s, end_s=self._end_s,
+                    on_progress=self.progress.emit,
+                )
+            self.finished.emit(self._output)
+        except Exception as exc:
+            self.error.emit(str(exc))
+
+
+class _SocialExportWorker(QThread):
+    progress = pyqtSignal(str)
+    finished = pyqtSignal(str)   # output path
+    error = pyqtSignal(str)
+
+    def __init__(self, input_path: str, output_path: str, platform: str) -> None:
+        super().__init__()
+        self._input = input_path
+        self._output = output_path
+        self._platform = platform
+
+    def run(self) -> None:
+        try:
+            from src.core.video_processor import export_social  # noqa: PLC0415
+            self.progress.emit(f"Exporting for {self._platform}…")
+            export_social(self._input, self._output, platform=self._platform)
+            self.finished.emit(self._output)
+        except Exception as exc:
+            self.error.emit(str(exc))
+
+
+class _DetectSilenceWorker(QThread):
+    finished = pyqtSignal(list)   # list of (start_s, end_s) tuples
+    error = pyqtSignal(str)
+
+    def __init__(self, input_path: str) -> None:
+        super().__init__()
+        self._input = input_path
+
+    def run(self) -> None:
+        try:
+            from src.core.video_processor import detect_silences  # noqa: PLC0415
+            silences = detect_silences(self._input)
+            self.finished.emit(silences)
+        except Exception as exc:
+            self.error.emit(str(exc))
+
+
+# --------------------------------------------------------------------------- #
+#  Helpers                                                                     #
+# --------------------------------------------------------------------------- #
+
+def _fmt(ms: int) -> str:
+    s = ms // 1000
+    return f"{s // 60:02d}:{s % 60:02d}"
+
+
+def _fmt_dur(ms: int) -> str:
+    s = ms // 1000
+    m, s = divmod(s, 60)
+    return f"{m}m {s:02d}s" if m else f"{s}s"
+
+
+def _h_sep() -> QFrame:
+    f = QFrame()
+    f.setFrameShape(QFrame.Shape.HLine)
+    f.setStyleSheet("color: #21262d;")
+    return f
+
+
+# --------------------------------------------------------------------------- #
+#  Main window                                                                 #
+# --------------------------------------------------------------------------- #
+
+class MainWindow(QMainWindow):
+    def __init__(self) -> None:
+        super().__init__()
+        self._video_path: str | None = None
+        self._duration: int = 0
+        self._split_worker: _SplitWorker | None = None
+        self._sub_worker: _SubExportWorker | None = None
+        self._social_worker: _SocialExportWorker | None = None
+        self._silence_worker: _DetectSilenceWorker | None = None
+
+        self.setWindowTitle("Cutyit")
+        self.setMinimumSize(1080, 660)
+
+        self._build_toolbar()
+        self._build_ui()
+        self._connect()
+        self._apply_style()
+
+    # ------------------------------------------------------------------ #
+    #  Layout                                                              #
+    # ------------------------------------------------------------------ #
+
+    def _build_ui(self) -> None:
+        root = QWidget()
+        self.setCentralWidget(root)
+        root_layout = QVBoxLayout(root)
+        root_layout.setContentsMargins(0, 0, 0, 0)
+        root_layout.setSpacing(0)
+
+        # ── Info bar (hidden until video is opened) ──────────────────── #
+        self._info_bar = QWidget()
+        self._info_bar.setObjectName("info_bar")
+        self._info_bar.setFixedHeight(26)
+        info_lay = QHBoxLayout(self._info_bar)
+        info_lay.setContentsMargins(10, 0, 10, 0)
+        info_lay.setSpacing(10)
+        self._lbl_filename = QLabel("")
+        self._lbl_filename.setObjectName("lbl_filename")
+        self._lbl_meta = QLabel("")
+        self._lbl_meta.setObjectName("lbl_meta")
+        info_lay.addWidget(self._lbl_filename)
+        info_lay.addWidget(self._lbl_meta)
+        info_lay.addStretch()
+        self._info_bar.hide()
+        root_layout.addWidget(self._info_bar)
+        root_layout.addWidget(_h_sep())
+
+        # ── Horizontal splitter ─────────────────────────────────────── #
+        h_split = QSplitter(Qt.Orientation.Horizontal)
+
+        # Left panel
+        left = QWidget()
+        left_layout = QVBoxLayout(left)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.setSpacing(4)
+
+        self.player = SubtitleOverlayPlayer()
+        left_layout.addWidget(self.player, 1)
+
+        self.timeline = TimelineWidget()
+        left_layout.addWidget(self.timeline)
+
+        h_split.addWidget(left)
+
+        # Right panel
+        right_panel = QWidget()
+        right_panel.setObjectName("right_panel")
+        right_layout = QVBoxLayout(right_panel)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.setSpacing(0)
+
+        self._tabs = QTabWidget()
+        self._tabs.setObjectName("editor_tabs")
+        self._tabs.setMinimumWidth(270)
+        self._tabs.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
+
+        self._tabs.addTab(self._build_split_tab(), "✂ Edit")
+        self.subtitle_editor = SubtitleEditorWidget()
+        _sub_scroll = QScrollArea()
+        _sub_scroll.setWidgetResizable(True)
+        _sub_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        _sub_scroll.setStyleSheet("QScrollArea { border: none; background: transparent; }")
+        _sub_scroll.setWidget(self.subtitle_editor)
+        self._tabs.addTab(_sub_scroll, "💬 Subs")
+        right_layout.addWidget(self._tabs)
+
+        h_split.addWidget(right_panel)
+        h_split.setSizes([760, 320])
+        h_split.setStretchFactor(0, 3)
+        h_split.setStretchFactor(1, 1)
+
+        root_layout.addWidget(h_split, 1)
+
+        # Status bar
+        self._status = QStatusBar()
+        self._status.setObjectName("app_status")
+        self.setStatusBar(self._status)
+        self._export_progress = QProgressBar()
+        self._export_progress.setRange(0, 100)
+        self._export_progress.setFixedWidth(160)
+        self._export_progress.setFixedHeight(16)
+        self._export_progress.setTextVisible(True)
+        self._export_progress.hide()
+        self._status.addPermanentWidget(self._export_progress)
+        self._status.showMessage("Ready — File › Open Video to begin")
+
+    def _build_split_tab(self) -> QWidget:
+        tab = QWidget()
+        lay = QVBoxLayout(tab)
+        lay.setContentsMargins(8, 8, 8, 8)
+        lay.setSpacing(5)
+
+        # ── Split at playhead ─────────────────────────────────────────── #
+        self._btn_add_split = QPushButton("＋  Split at Current Position")
+        self._btn_add_split.setObjectName("btn_primary")
+        self._btn_add_split.setToolTip("Add a cut point at the playhead  (S)")
+        self._btn_add_split.setEnabled(False)
+        self._btn_add_split.setFixedHeight(28)
+        lay.addWidget(self._btn_add_split)
+
+        # ── Auto-split + silence row ──────────────────────────────────── #
+        auto_row = QHBoxLayout()
+        auto_row.setSpacing(4)
+        self._lbl_seg_count = QLabel("1 seg")
+        self._lbl_seg_count.setObjectName("lbl_muted")
+        auto_row.addWidget(self._lbl_seg_count)
+        auto_row.addStretch()
+        auto_row.addWidget(QLabel("Every:"))
+        self._split_interval_sp = QSpinBox()
+        self._split_interval_sp.setRange(5, 3600)
+        self._split_interval_sp.setValue(30)
+        self._split_interval_sp.setSuffix(" s")
+        self._split_interval_sp.setFixedWidth(64)
+        auto_row.addWidget(self._split_interval_sp)
+        self._btn_auto_split = QPushButton("⏱")
+        self._btn_auto_split.setEnabled(False)
+        self._btn_auto_split.setFixedSize(26, 26)
+        self._btn_auto_split.setToolTip("Auto-split at regular intervals")
+        auto_row.addWidget(self._btn_auto_split)
+        self._btn_silence = QPushButton("🔇")
+        self._btn_silence.setEnabled(False)
+        self._btn_silence.setFixedSize(26, 26)
+        self._btn_silence.setToolTip(
+            "Detect silences and auto-add split points at their midpoints"
+        )
+        auto_row.addWidget(self._btn_silence)
+        lay.addLayout(auto_row)
+
+        # ── Segments list ─────────────────────────────────────────────── #
+        hdr = QLabel("SEGMENTS")
+        hdr.setObjectName("section_header")
+        lay.addWidget(hdr)
+
+        self._split_list = QListWidget()
+        self._split_list.setObjectName("segment_list")
+        self._split_list.setToolTip("Click to seek · double-click to jump to start")
+        lay.addWidget(self._split_list, 1)
+
+        # ── Remove / Export row ───────────────────────────────────────── #
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(5)
+        self._btn_del_split = QPushButton("✕ Remove")
+        self._btn_del_split.setEnabled(False)
+        self._btn_del_split.setFixedHeight(26)
+        btn_row.addWidget(self._btn_del_split)
+        self._btn_export = QPushButton("⬇ Export Segments…")
+        self._btn_export.setObjectName("btn_primary")
+        self._btn_export.setEnabled(False)
+        self._btn_export.setFixedHeight(26)
+        btn_row.addWidget(self._btn_export)
+        lay.addLayout(btn_row)
+
+        # ── Social export row ─────────────────────────────────────────── #
+        social_row = QHBoxLayout()
+        social_row.setSpacing(5)
+        self._social_cb = QComboBox()
+        self._social_cb.addItems(["TikTok", "Reels", "Shorts"])
+        self._social_cb.setFixedWidth(80)
+        self._social_cb.setToolTip("Target platform for social export")
+        social_row.addWidget(self._social_cb)
+        self._btn_social = QPushButton("📱 Export for Social…")
+        self._btn_social.setObjectName("btn_primary")
+        self._btn_social.setEnabled(False)
+        self._btn_social.setFixedHeight(26)
+        self._btn_social.setToolTip(
+            "Re-encode as 1080×1920 vertical video with loudness normalisation"
+        )
+        social_row.addWidget(self._btn_social)
+        lay.addLayout(social_row)
+
+        return tab
+
+    def _build_toolbar(self) -> None:
+        tb = QToolBar("Main")
+        tb.setMovable(False)
+        tb.setObjectName("main_toolbar")
+        tb.setIconSize(__import__('PyQt6.QtCore', fromlist=['QSize']).QSize(16, 16))
+        self.addToolBar(tb)
+
+        logo = QLabel(" ✂ Cutyit")
+        logo.setObjectName("toolbar_logo")
+        tb.addWidget(logo)
+
+        gap = QWidget()
+        gap.setFixedWidth(10)
+        tb.addWidget(gap)
+
+        act_open = QAction(" Open Video… ", self)
+        act_open.setShortcut(QKeySequence.StandardKey.Open)
+        act_open.triggered.connect(self._open_video)
+        tb.addAction(act_open)
+
+        tb.addSeparator()
+
+        self._act_export = QAction(" Export Segments… ", self)
+        self._act_export.setEnabled(False)
+        self._act_export.triggered.connect(self._export_segments)
+        tb.addAction(self._act_export)
+
+        stretch = QWidget()
+        stretch.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        tb.addWidget(stretch)
+
+    # ------------------------------------------------------------------ #
+    #  Signal wiring                                                       #
+    # ------------------------------------------------------------------ #
+
+    def _connect(self) -> None:
+        # Player ↔ timeline sync
+        self.player.duration_changed.connect(self._on_duration)
+        self.player.position_changed.connect(self.timeline.set_position)
+        self.player.position_changed.connect(self._update_split_btn)
+
+        # Timeline → player seek
+        self.timeline.position_changed.connect(self.player.seek)
+        self.timeline.split_added.connect(self._on_split_changed)
+        self.timeline.split_removed.connect(self._on_split_changed)
+
+        # Split tab
+        self._btn_add_split.clicked.connect(self._add_split_here)
+        self._btn_del_split.clicked.connect(self._remove_selected_split)
+        self._btn_export.clicked.connect(self._export_segments)
+        self._split_list.currentRowChanged.connect(self._on_segment_selected)
+        self._split_list.itemDoubleClicked.connect(self._on_segment_double_clicked)
+
+        # Subtitle editor
+        self.subtitle_editor.jump_to.connect(self.player.seek)
+        self.subtitle_editor.export_with_subs.connect(self._export_with_subs)
+
+        # Live subtitle preview
+        self.subtitle_editor.subtitles_updated.connect(self.player.set_subtitle_rows)
+        self.subtitle_editor.subtitles_updated.connect(self.timeline.set_subtitle_rows)
+        self.subtitle_editor.word_rows_updated.connect(self.player.set_word_rows)
+        self.subtitle_editor.style_preview_changed.connect(self.player.set_subtitle_style)
+
+        # Subtitle drag position → stored in editor for ASS export
+        self.player.drag_position_changed.connect(self.subtitle_editor.set_drag_offset)
+
+        # Native video size → editor uses it to export ASS at the correct PlayRes
+        self.player.video_native_size_changed.connect(self.subtitle_editor.set_native_video_size)
+
+        # Table auto-scroll to active subtitle row during playback
+        self.player.position_changed.connect(self.subtitle_editor.sync_to_position)
+
+        # Keyboard shortcuts
+        QShortcut(QKeySequence("Space"), self).activated.connect(self.player.toggle_play)
+        QShortcut(QKeySequence("S"), self).activated.connect(self._add_split_here)
+        QShortcut(QKeySequence("C"), self).activated.connect(self._add_split_here)
+        QShortcut(QKeySequence("Left"), self).activated.connect(
+            lambda: self.player.seek(max(0, self.player.position() - 5_000))
+        )
+        QShortcut(QKeySequence("Right"), self).activated.connect(
+            lambda: self.player.seek(min(self._duration, self.player.position() + 5_000))
+        )
+        QShortcut(QKeySequence("Shift+Left"), self).activated.connect(
+            lambda: self.player.seek(max(0, self.player.position() - 1_000))
+        )
+        QShortcut(QKeySequence("Shift+Right"), self).activated.connect(
+            lambda: self.player.seek(min(self._duration, self.player.position() + 1_000))
+        )
+        # Subtitle navigation
+        QShortcut(QKeySequence("Down"), self).activated.connect(
+            self.subtitle_editor.select_next_subtitle
+        )
+        QShortcut(QKeySequence("Up"), self).activated.connect(
+            self.subtitle_editor.select_prev_subtitle
+        )
+        QShortcut(QKeySequence("Alt+Left"), self).activated.connect(
+            lambda: self.subtitle_editor.nudge_selected(-100)
+        )
+        QShortcut(QKeySequence("Alt+Right"), self).activated.connect(
+            lambda: self.subtitle_editor.nudge_selected(100)
+        )
+        QShortcut(QKeySequence("Backspace"), self).activated.connect(
+            self.subtitle_editor.delete_selected_subtitle
+        )
+        QShortcut(QKeySequence("Return"), self).activated.connect(
+            lambda: self.subtitle_editor.add_subtitle_at(self.player.position())
+        )
+        # Auto-split at intervals
+        self._btn_auto_split.clicked.connect(self._auto_split_intervals)
+        # Social export
+        self._btn_social.clicked.connect(self._export_social)
+        # Silence detection
+        self._btn_silence.clicked.connect(self._detect_silences)
+
+    # ------------------------------------------------------------------ #
+    #  Slots — playback                                                    #
+    # ------------------------------------------------------------------ #
+
+    def _on_duration(self, ms: int) -> None:
+        self._duration = ms
+        self.timeline.set_duration(ms)
+        self._btn_add_split.setEnabled(True)
+        self._btn_export.setEnabled(True)
+        self._act_export.setEnabled(True)
+        self._btn_social.setEnabled(True)
+        self._btn_auto_split.setEnabled(True)
+        self._btn_silence.setEnabled(True)
+        self._refresh_split_list()
+
+    def _update_split_btn(self, ms: int) -> None:
+        if self._video_path:
+            self._btn_add_split.setText(f"＋ Split at {_fmt(ms)}")
+
+    # ------------------------------------------------------------------ #
+    #  Slots — split management                                            #
+    # ------------------------------------------------------------------ #
+
+    def _on_split_changed(self, _=None) -> None:
+        self._refresh_split_list()
+
+    def _add_split_here(self) -> None:
+        if not self._video_path:
+            return
+        pos = self.player.position()
+        if 0 < pos < self._duration:
+            self.timeline.add_split(pos)
+            self._refresh_split_list()
+
+    def _auto_split_intervals(self) -> None:
+        """Add split points at regular time intervals across the entire video."""
+        if not self._duration:
+            return
+        interval_ms = self._split_interval_sp.value() * 1000
+        t = interval_ms
+        added = 0
+        while t < self._duration:
+            self.timeline.add_split(t)
+            added += 1
+            t += interval_ms
+        if added:
+            self._refresh_split_list()
+        self._status.showMessage(
+            f"Added {added} split point(s) every {self._split_interval_sp.value()}s"
+        )
+
+    def _remove_selected_split(self) -> None:
+        row = self._split_list.currentRow()
+        # row in the list == segment index; split index == row (since row 0 = "0 → sp[0]")
+        # We need to map segment row → split index
+        splits = self.timeline.split_points()
+        # segments: [0..sp[0], sp[0]..sp[1], ..., sp[n-1]..dur]
+        # split idx for segment i = i - 1 (but segment 0 has no split before it)
+        # "Remove" actually removes the split BEFORE this segment (its left boundary)
+        # More intuitive: remove the right boundary of the selected segment
+        # i.e. split at index == row (segment 0's right split is splits[0], etc.)
+        if 0 <= row < len(splits):
+            self.timeline.remove_split(row)
+            self._refresh_split_list()
+
+    def _refresh_split_list(self) -> None:
+        splits = self.timeline.split_points()
+        self._split_list.clear()
+        boundaries = [0] + splits + [self._duration]
+        segs_info: list[tuple[int, int, str]] = []
+        for i in range(len(boundaries) - 1):
+            s, e = boundaries[i], boundaries[i + 1]
+            dur_label = _fmt_dur(e - s)
+            self._split_list.addItem(
+                f"  Segment {i + 1}   {_fmt(s)} → {_fmt(e)}  ·  {dur_label}"
+            )
+            segs_info.append((s, e, f"Segment {i + 1}  ({_fmt(s)} – {_fmt(e)})"))
+        n = len(boundaries) - 1
+        self._lbl_seg_count.setText(f"{n} seg{'s' if n != 1 else ''}")
+        self._btn_del_split.setEnabled(False)
+        self.subtitle_editor.update_segments(segs_info)
+
+    def _on_segment_selected(self, row: int) -> None:
+        """Single-click: enable Remove and seek to segment start."""
+        self._btn_del_split.setEnabled(row >= 0)
+        if row >= 0:
+            splits = self.timeline.split_points()
+            boundaries = [0] + splits + [self._duration]
+            if row < len(boundaries) - 1:
+                self.player.seek(boundaries[row])
+
+    def _on_segment_double_clicked(self, item) -> None:
+        row = self._split_list.row(item)
+        splits = self.timeline.split_points()
+        boundaries = [0] + splits + [self._duration]
+        if 0 <= row < len(boundaries) - 1:
+            self.player.seek(boundaries[row])
+
+    # ------------------------------------------------------------------ #
+    #  File operations                                                     #
+    # ------------------------------------------------------------------ #
+
+    def _open_video(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Open Video",
+            QDir.homePath(),
+            "Video Files (*.mp4 *.mov *.mkv *.avi *.webm *.m4v *.flv *.wmv *.ts);;All Files (*)",
+            options=QFileDialog.Option.DontUseNativeDialog,
+        )
+        if not path:
+            return
+
+        self._video_path = path
+        self.player.load(path)
+        self.player.play()
+        self.player.set_subtitle_rows([])          # clear previous overlay
+        self.subtitle_editor.set_video_path(path)
+        self.timeline.set_duration(0)
+        self._refresh_split_list()
+
+        name = os.path.basename(path)
+        self._lbl_filename.setText(f"📄  {name}")
+        self._update_meta_label(path)
+        self._info_bar.show()
+        self.setWindowTitle(f"Cutyit — {name}")
+        self._status.showMessage(f"Opened: {path}")
+
+    def _update_meta_label(self, path: str) -> None:
+        try:
+            from src.core.video_processor import get_video_info  # noqa: PLC0415
+            info = get_video_info(path)
+            w   = info.get("width", "?")
+            h   = info.get("height", "?")
+            fps = info.get("fps", "?")
+            dur = info.get("duration_ms", 0)
+            self._lbl_meta.setText(f"{w}×{h}  ·  {fps} fps  ·  {_fmt_dur(dur)}")
+        except Exception:
+            self._lbl_meta.setText("")
+
+    # ------------------------------------------------------------------ #
+    #  Export — split segments                                             #
+    # ------------------------------------------------------------------ #
+
+    def _export_segments(self) -> None:
+        if not self._video_path:
+            return
+        out_dir = QFileDialog.getExistingDirectory(
+            self, "Select Output Folder", os.path.dirname(self._video_path),
+            options=QFileDialog.Option.DontUseNativeDialog,
+        )
+        if not out_dir:
+            return
+
+        splits = self.timeline.split_points()
+        self._set_export_busy(True)
+        self._status.showMessage("Exporting segments…")
+
+        self._split_worker = _SplitWorker(self._video_path, splits, out_dir)
+        self._split_worker.progress.connect(self._status.showMessage)
+        self._split_worker.finished.connect(self._on_split_done)
+        self._split_worker.error.connect(self._on_split_error)
+        self._split_worker.start()
+
+    def _on_split_done(self, paths: list) -> None:
+        self._set_export_busy(False)
+        self._status.showMessage(f"Exported {len(paths)} segment(s)")
+        QMessageBox.information(
+            self,
+            "Export Complete",
+            f"Saved {len(paths)} segment(s):\n" + "\n".join(os.path.basename(p) for p in paths),
+        )
+
+    def _on_split_error(self, msg: str) -> None:
+        self._set_export_busy(False)
+        self._status.showMessage("Export failed")
+        QMessageBox.critical(self, "Export Error", msg)
+
+    def _set_export_busy(self, busy: bool) -> None:
+        self._btn_export.setEnabled(not busy)
+        self._act_export.setEnabled(not busy)
+
+    # ------------------------------------------------------------------ #
+    #  Export — with subtitles                                             #
+    # ------------------------------------------------------------------ #
+
+    def _export_with_subs(self, srt_path: str, burn_in: bool, start_ms: int, end_ms: int) -> None:
+        if not self._video_path:
+            os.unlink(srt_path)
+            return
+
+        ext = os.path.splitext(self._video_path)[1]
+        if not burn_in and ext.lower() not in (".mp4", ".m4v"):
+            ext = ".mp4"   # mov_text requires MP4 container
+
+        stem = os.path.splitext(self._video_path)[0]
+        suffix = "_burned" if burn_in else "_subbed"
+        output_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save Video with Subtitles",
+            stem + suffix + ext,
+            f"Video (*{ext})",
+            options=QFileDialog.Option.DontUseNativeDialog,
+        )
+        if not output_path:
+            os.unlink(srt_path)
+            return
+
+        self._status.showMessage("Exporting with subtitles…")
+        self._export_progress.setValue(0)
+        self._export_progress.show()
+        self._sub_worker = _SubExportWorker(
+            self._video_path, srt_path, output_path, burn_in,
+            start_ms=start_ms, end_ms=end_ms,
+        )
+        self._sub_worker.progress.connect(self._on_sub_progress)
+        self._sub_worker.finished.connect(lambda p: self._on_sub_done(p, srt_path))
+        self._sub_worker.error.connect(lambda e: self._on_sub_error(e, srt_path))
+        self._sub_worker.start()
+
+    def _on_sub_progress(self, pct: int) -> None:
+        self._export_progress.setValue(pct)
+        self._status.showMessage(f"Exporting with subtitles… {pct}%")
+
+    def _on_sub_done(self, output_path: str, srt_path: str) -> None:
+        self._export_progress.hide()
+        _cleanup(srt_path)
+        self._status.showMessage(f"Saved: {os.path.basename(output_path)}")
+        QMessageBox.information(self, "Export Complete", f"Saved:\n{output_path}")
+
+    def _on_sub_error(self, msg: str, srt_path: str) -> None:
+        self._export_progress.hide()
+        _cleanup(srt_path)
+        self._status.showMessage("Export failed")
+        QMessageBox.critical(self, "Export Error", msg)
+
+    # ------------------------------------------------------------------ #
+    #  Export — social (TikTok / Reels / Shorts)                           #
+    # ------------------------------------------------------------------ #
+
+    def _export_social(self) -> None:
+        if not self._video_path:
+            return
+        platform = self._social_cb.currentText()
+        stem = os.path.splitext(self._video_path)[0]
+        output_path, _ = QFileDialog.getSaveFileName(
+            self,
+            f"Export for {platform}",
+            f"{stem}_{platform.lower()}_1080x1920.mp4",
+            "Video Files (*.mp4)",
+            options=QFileDialog.Option.DontUseNativeDialog,
+        )
+        if not output_path:
+            return
+        self._btn_social.setEnabled(False)
+        self._status.showMessage(f"Exporting for {platform}…")
+        self._social_worker = _SocialExportWorker(
+            self._video_path, output_path, platform
+        )
+        self._social_worker.progress.connect(self._status.showMessage)
+        self._social_worker.finished.connect(self._on_social_done)
+        self._social_worker.error.connect(self._on_social_error)
+        self._social_worker.start()
+
+    def _on_social_done(self, output_path: str) -> None:
+        self._btn_social.setEnabled(True)
+        self._status.showMessage(f"Saved: {os.path.basename(output_path)}")
+        QMessageBox.information(
+            self, "Social Export Complete", f"Saved:\n{output_path}"
+        )
+
+    def _on_social_error(self, msg: str) -> None:
+        self._btn_social.setEnabled(True)
+        self._status.showMessage("Social export failed")
+        QMessageBox.critical(self, "Social Export Error", msg)
+
+    # ------------------------------------------------------------------ #
+    #  Silence detection                                                   #
+    # ------------------------------------------------------------------ #
+
+    def _detect_silences(self) -> None:
+        if not self._video_path:
+            return
+        self._btn_silence.setEnabled(False)
+        self._status.showMessage("Detecting silences…")
+        self._silence_worker = _DetectSilenceWorker(self._video_path)
+        self._silence_worker.finished.connect(self._on_silences_done)
+        self._silence_worker.error.connect(self._on_silences_error)
+        self._silence_worker.start()
+
+    def _on_silences_done(self, silences: list) -> None:
+        self._btn_silence.setEnabled(True)
+        if not silences:
+            self._status.showMessage("No silences detected — try a lower threshold")
+            QMessageBox.information(
+                self, "Silence Detection",
+                "No silent regions found.\n\n"
+                "The video may have continuous audio, or try a lower\n"
+                "noise threshold (edit video_processor.py: noise_threshold).",
+            )
+            return
+        added = 0
+        for start_s, end_s in silences:
+            mid_ms = int((start_s + end_s) / 2.0 * 1000)
+            if 0 < mid_ms < self._duration:
+                self.timeline.add_split(mid_ms)
+                added += 1
+        if added:
+            self._refresh_split_list()
+        self._status.showMessage(
+            f"Found {len(silences)} silent region(s) \u2014 added {added} split point(s)"
+        )
+
+    def _on_silences_error(self, msg: str) -> None:
+        self._btn_silence.setEnabled(True)
+        self._status.showMessage("Silence detection failed")
+        QMessageBox.critical(self, "Silence Detection Error", msg)
+
+    # ------------------------------------------------------------------ #
+    #  Styling                                                             #
+    # ------------------------------------------------------------------ #
+
+    def _apply_style(self) -> None:
+        self.setStyleSheet("""
+            QMainWindow, QWidget {
+                background-color: #0d1117;
+                color: #e6edf3;
+                font-size: 12px;
+            }
+            QToolBar#main_toolbar {
+                background: #161b22;
+                border-bottom: 1px solid #21262d;
+                padding: 2px 6px;
+                spacing: 1px;
+            }
+            QToolBar#main_toolbar::separator {
+                background: #30363d; width: 1px; margin: 4px 3px;
+            }
+            QToolBar QToolButton {
+                color: #c9d1d9; background: transparent;
+                border: 1px solid transparent;
+                padding: 3px 10px; border-radius: 5px; font-size: 12px;
+            }
+            QToolBar QToolButton:hover { background: #21262d; border-color: #30363d; }
+            QToolBar QToolButton:pressed { background: #161b22; }
+            QLabel#toolbar_logo {
+                color: #58a6ff; font-size: 13px; font-weight: bold; padding: 0 4px;
+            }
+            QWidget#info_bar { background: #161b22; border-bottom: 1px solid #21262d; }
+            QLabel#lbl_filename { color: #c9d1d9; font-weight: bold; font-size: 12px; }
+            QLabel#lbl_meta {
+                color: #8b949e; font-size: 11px;
+                font-family: 'SF Mono', 'Menlo', monospace;
+            }
+            QSplitter::handle { background: #21262d; }
+            QSplitter::handle:horizontal { width: 1px; }
+            QWidget#right_panel { border-left: 1px solid #21262d; }
+            QTabWidget#editor_tabs::pane { border: none; background: #0d1117; }
+            QTabBar { background: #161b22; }
+            QTabBar::tab {
+                background: transparent; color: #8b949e;
+                padding: 6px 16px; border: none;
+                border-bottom: 2px solid transparent; font-size: 12px;
+            }
+            QTabBar::tab:selected {
+                color: #e6edf3; border-bottom: 2px solid #1f6feb; background: #0d1117;
+            }
+            QTabBar::tab:hover:!selected { color: #c9d1d9; background: #21262d; }
+            QWidget#player_controls { background: #0d1117; }
+            QLabel#lbl_timecode {
+                color: #8b949e; font-family: 'SF Mono', 'Menlo', monospace; font-size: 11px;
+            }
+            QLabel#sub_preview_badge {
+                background: #1f6feb; color: #ffffff;
+                font-size: 10px; font-weight: bold; letter-spacing: 1px;
+                padding: 2px 6px; border-radius: 4px;
+            }
+            QSlider#seek_bar::groove:horizontal {
+                height: 4px; background: #21262d; border-radius: 2px;
+            }
+            QSlider#seek_bar::sub-page:horizontal {
+                background: qlineargradient(x1:0,y1:0,x2:1,y2:0,
+                    stop:0 #1f6feb, stop:1 #388bfd);
+                border-radius: 2px;
+            }
+            QSlider#seek_bar::handle:horizontal {
+                background: #e6edf3; width: 12px; height: 12px;
+                margin: -4px 0; border-radius: 6px;
+            }
+            QSlider#seek_bar::handle:horizontal:hover { background: #ffffff; }
+            QSlider#vol_bar::groove:horizontal {
+                height: 3px; background: #30363d; border-radius: 1px;
+            }
+            QSlider#vol_bar::sub-page:horizontal { background: #8b949e; border-radius: 1px; }
+            QSlider#vol_bar::handle:horizontal {
+                background: #c9d1d9; width: 9px; height: 9px;
+                margin: -3px 0; border-radius: 4px;
+            }
+            QPushButton#btn_primary {
+                background: #1f6feb; color: #ffffff; border: none;
+                padding: 4px 12px; border-radius: 5px; font-weight: 600;
+            }
+            QPushButton#btn_primary:hover { background: #388bfd; }
+            QPushButton#btn_primary:pressed { background: #1158c7; }
+            QPushButton#btn_primary:disabled { background: #21262d; color: #484f58; }
+            QPushButton#btn_play_primary {
+                background: #1f6feb; color: #ffffff; border: none;
+                border-radius: 5px; font-size: 14px; font-weight: bold;
+            }
+            QPushButton#btn_play_primary:hover { background: #388bfd; }
+            QPushButton#btn_play_primary:pressed { background: #1158c7; }
+            QPushButton {
+                background: #21262d; color: #c9d1d9;
+                border: 1px solid #30363d; padding: 3px 10px; border-radius: 5px;
+            }
+            QPushButton:hover { background: #30363d; border-color: #8b949e; }
+            QPushButton:pressed { background: #161b22; }
+            QPushButton:disabled { color: #484f58; border-color: #21262d; }
+            QPushButton:checked { background: #1a3a5a; border-color: #1f6feb; color: #58a6ff; }
+            QLabel#section_header {
+                color: #8b949e; font-size: 10px; font-weight: bold; letter-spacing: 1px;
+            }
+            QLabel#lbl_muted { color: #8b949e; font-size: 11px; }
+            QListWidget#segment_list {
+                background: #161b22; border: 1px solid #21262d;
+                border-radius: 5px; outline: none;
+            }
+            QListWidget#segment_list::item {
+                padding: 4px 4px; border-bottom: 1px solid #21262d;
+            }
+            QListWidget#segment_list::item:selected { background: #1f3a5a; color: #58a6ff; }
+            QListWidget#segment_list::item:hover:!selected { background: #1c2128; }
+            QTableWidget {
+                background: #161b22; gridline-color: #21262d;
+                alternate-background-color: #0d1117;
+                border: 1px solid #21262d; border-radius: 4px; outline: none;
+            }
+            QTableWidget::item:selected { background: #1f3a5a; color: #58a6ff; }
+            QHeaderView::section {
+                background: #161b22; color: #8b949e; border: none;
+                border-right: 1px solid #21262d; border-bottom: 1px solid #21262d;
+                padding: 3px 5px; font-size: 11px; font-weight: bold;
+            }
+            QComboBox {
+                background: #161b22; border: 1px solid #30363d;
+                color: #c9d1d9; padding: 3px 6px; border-radius: 5px;
+            }
+            QComboBox:hover { border-color: #58a6ff; }
+            QComboBox::drop-down { border: none; }
+            QComboBox QAbstractItemView {
+                background: #161b22; color: #c9d1d9; border: 1px solid #30363d;
+                selection-background-color: #1f3a5a;
+            }
+            QSpinBox, QDoubleSpinBox {
+                background: #161b22; border: 1px solid #30363d;
+                color: #c9d1d9; padding: 2px 5px; border-radius: 4px;
+            }
+            QSpinBox:hover, QDoubleSpinBox:hover { border-color: #58a6ff; }
+            QCheckBox { color: #c9d1d9; spacing: 5px; }
+            QCheckBox::indicator {
+                width: 13px; height: 13px; border: 1px solid #30363d;
+                border-radius: 3px; background: #161b22;
+            }
+            QCheckBox::indicator:checked { background: #1f6feb; border-color: #1f6feb; }
+            QGroupBox {
+                color: #8b949e; border: 1px solid #21262d; border-radius: 5px;
+                margin-top: 10px; padding-top: 6px;
+                font-size: 10px; font-weight: bold;
+            }
+            QGroupBox::title { subcontrol-origin: margin; left: 8px; padding: 0 3px; }
+            QScrollArea { border: none; background: transparent; }
+            QScrollBar:vertical { background: #0d1117; width: 7px; border-radius: 3px; }
+            QScrollBar::handle:vertical {
+                background: #30363d; border-radius: 3px; min-height: 20px;
+            }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
+            QScrollBar:horizontal { background: #0d1117; height: 7px; border-radius: 3px; }
+            QScrollBar::handle:horizontal {
+                background: #30363d; border-radius: 3px; min-width: 20px;
+            }
+            QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
+            QProgressBar { background: #21262d; border: none; border-radius: 2px; }
+            QProgressBar::chunk { background: #1f6feb; border-radius: 2px; }
+            QStatusBar#app_status {
+                background: #161b22; color: #8b949e;
+                border-top: 1px solid #21262d; font-size: 11px;
+            }
+            QMessageBox { background: #161b22; color: #e6edf3; }
+        """)
+
+
+def _cleanup(path: str) -> None:
+    try:
+        os.unlink(path)
+    except Exception:
+        pass

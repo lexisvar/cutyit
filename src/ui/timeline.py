@@ -253,7 +253,10 @@ class TimelineWidget(QWidget):
             base = _SEG_COLORS[i % len(_SEG_COLORS)]
             seg_r = QRect(x1 + 1, _VIDEO_Y + 2, x2 - x1 - 2, _VIDEO_H - 4)
             # vertical gradient: slightly lighter top
-            grad = QLinearGradient(seg_r.topLeft(), seg_r.bottomLeft())
+            grad = QLinearGradient(
+                float(seg_r.left()), float(seg_r.top()),
+                float(seg_r.left()), float(seg_r.bottom())
+            )
             light = QColor(min(255, base.red() + 30),
                            min(255, base.green() + 30),
                            min(255, base.blue() + 30), 210)

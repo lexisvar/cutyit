@@ -12,6 +12,7 @@ from PyQt6.QtGui import QAction, QKeySequence, QShortcut
 from src.ui.subtitle_overlay import SubtitleOverlayPlayer
 from src.ui.timeline import TimelineWidget
 from src.ui.subtitle_editor import SubtitleEditorWidget
+from src.ui.overlay_panel import OverlayPanel
 
 
 # --------------------------------------------------------------------------- #
@@ -231,6 +232,13 @@ class MainWindow(QMainWindow):
         _sub_scroll.setStyleSheet("QScrollArea { border: none; background: transparent; }")
         _sub_scroll.setWidget(self.subtitle_editor)
         self._tabs.addTab(_sub_scroll, "💬 Subs")
+        self.overlay_panel = OverlayPanel()
+        _ovl_scroll = QScrollArea()
+        _ovl_scroll.setWidgetResizable(True)
+        _ovl_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        _ovl_scroll.setStyleSheet("QScrollArea { border: none; background: transparent; }")
+        _ovl_scroll.setWidget(self.overlay_panel)
+        self._tabs.addTab(_ovl_scroll, "🖼 Overlays")
         right_layout.addWidget(self._tabs)
 
         h_split.addWidget(right_panel)
@@ -405,6 +413,11 @@ class MainWindow(QMainWindow):
         # Subtitle drag on timeline → update editor table
         self.timeline.subtitle_moved.connect(self.subtitle_editor.on_subtitle_moved)
 
+        # Overlay panel ↔ timeline
+        self.overlay_panel.overlays_changed.connect(self.timeline.set_overlay_rows)
+        self.timeline.overlay_moved.connect(self.overlay_panel.on_overlay_moved)
+        self.player.position_changed.connect(self.overlay_panel.set_playhead)
+
         # Subtitle drag position → stored in editor for ASS export
         self.player.drag_position_changed.connect(self.subtitle_editor.set_drag_offset)
 
@@ -463,6 +476,7 @@ class MainWindow(QMainWindow):
     def _on_duration(self, ms: int) -> None:
         self._duration = ms
         self.timeline.set_duration(ms)
+        self.overlay_panel.set_duration(ms)
         self._btn_add_split.setEnabled(True)
         self._btn_export.setEnabled(True)
         self._act_export.setEnabled(True)
@@ -585,7 +599,9 @@ class MainWindow(QMainWindow):
         self.player.play()
         self.player.set_subtitle_rows([])          # clear previous overlay
         self.subtitle_editor.set_video_path(path)
+        self.overlay_panel.set_video_path(path)
         self.timeline.set_duration(0)
+        self.timeline.set_overlay_rows([])
         self._refresh_split_list()
 
         name = os.path.basename(path)

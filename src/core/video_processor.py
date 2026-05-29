@@ -266,3 +266,80 @@ def detect_silences(
                 silences.append((start, float(m.group(1))))
                 start = None
     return silences
+
+
+def burn_image_overlays(
+    input_path: str,
+    overlays: list,
+    output_path: str,
+    x: int = 10,
+    y: int = 10,
+    size_pct: int = 30,
+    on_progress: Callable[[int], None] | None = None,
+) -> None:
+    """Composite image overlays onto a video using FFmpeg.
+
+    Each entry in *overlays* is a (start_ms, end_ms, image_path) tuple.
+    The image is scaled to *size_pct* % of the video width and placed at
+    pixel offset (*x*, *y*) from the top-left corner.
+
+    Requires re-encode of the video track.
+    """
+    if not overlays:
+        raise ValueError("No overlays provided")
+
+    # Probe video width to compute absolute scale
+    info = get_video_info(input_path)
+    video_w = next(
+        (s["width"] for s in info["streams"] if s["codec_type"] == "video"),
+        1920,
+    )
+    scale_w = max(1, int(video_w * size_pct / 100))
+    total_s = get_duration_ms(input_path) / 1000.0
+
+    # Build inputs: main video first, then one -i per image
+    inputs: list[str] = ["-i", input_path]
+    for _, _, img_path in overlays:
+        inputs += ["-i", img_path]
+
+    # Build filter_complex string
+    # Stream [0:v] is the video; [1:v], [2:v], … are the images
+    parts: list[str] = []
+    prev = "[0:v]"
+    for idx, (start_ms, end_ms, _) in enumerate(overlays):
+        img_idx  = idx + 1
+        scaled   = f"[sc{idx}]"
+        blended  = f"[bl{idx}]"
+        t_s      = start_ms / 1000.0
+        t_e      = end_ms   / 1000.0
+        parts.append(f"[{img_idx}:v]scale={scale_w}:-1{scaled}")
+        parts.append(
+            f"{prev}{scaled}overlay={x}:{y}:enable='between(t,{t_s:.3f},{t_e:.3f})'{blended}"
+        )
+        prev = blended
+
+    # Strip trailing label brackets — last output is the final video stream
+    filter_complex = ";".join(parts)
+    # Rename last output to [vout]
+    filter_complex = filter_complex[: filter_complex.rfind("[")] + "[vout]"
+
+    args = [
+        *inputs,
+        "-filter_complex", filter_complex,
+        "-map", "[vout]",
+        "-map", "0:a?",
+        "-c:v", "libx264",
+        "-preset", "fast",
+        "-crf", "18",
+        "-c:a", "copy",
+        output_path,
+    ]
+
+    if on_progress is not None:
+        rc, stderr = _run_ffmpeg_progress(args, total_s, on_progress)
+    else:
+        result = _run_ffmpeg(*args)
+        rc, stderr = result.returncode, result.stderr
+
+    if rc != 0:
+        raise RuntimeError(f"FFmpeg overlay burn failed:\n{stderr}")

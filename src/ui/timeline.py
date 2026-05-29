@@ -1,3 +1,4 @@
+import os
 from PyQt6.QtWidgets import QWidget, QSizePolicy, QMenu, QToolTip
 from PyQt6.QtCore import Qt, pyqtSignal, QRect, QPoint
 from PyQt6.QtGui import (
@@ -17,7 +18,9 @@ _HANDLE_R  = 5      # playhead circle radius
 
 _VIDEO_Y  = _PAD_TOP + _RULER_H
 _SUB_Y    = _VIDEO_Y + _VIDEO_H + _TRACK_GAP
-_WIDGET_H = _SUB_Y + _SUB_H + _PAD_BOT
+_OVL_H    = 22   # image overlay track
+_OVL_Y    = _SUB_Y + _SUB_H + _TRACK_GAP
+_WIDGET_H = _OVL_Y + _OVL_H + _PAD_BOT
 
 # Clip fill colours (gradient-lit)
 _SEG_COLORS = [
@@ -32,6 +35,7 @@ _C_BG        = QColor(22,  27,  34)
 _C_HDR_BG   = QColor(28,  35,  44)
 _C_TRACK_BG  = QColor(45,  51,  62)
 _C_SUB_BG    = QColor(36,  42,  52)
+_C_OVL_BG    = QColor(42,  36,  52)
 _C_PLAYHEAD  = QColor(255, 255, 255)
 _C_CUT_IDLE  = QColor(255, 200,  50)
 _C_CUT_HOV   = QColor(255,  80,  80)
@@ -78,6 +82,7 @@ class TimelineWidget(QWidget):
     split_added      = pyqtSignal(int)      # ms — new cut
     split_removed    = pyqtSignal(int)      # index removed  (-1 = all cleared)
     subtitle_moved   = pyqtSignal(int, int, int)  # row, new_start_ms, new_end_ms
+    overlay_moved    = pyqtSignal(int, int, int)  # row, new_start_ms, new_end_ms
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -90,6 +95,8 @@ class TimelineWidget(QWidget):
         self._zoom       : float     = 1.0
         self._zoom_start : int       = 0
         self._sub_drag   : dict | None = None  # subtitle drag/resize state
+        self._overlay_rows: list[tuple] = []
+        self._ovl_drag   : dict | None = None  # overlay drag/resize state
 
         self.setFixedHeight(_WIDGET_H)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
@@ -105,6 +112,7 @@ class TimelineWidget(QWidget):
         self._zoom       = 1.0
         self._zoom_start = 0
         self._subtitle_rows = []
+        self._overlay_rows  = []
         self.update()
 
     def set_position(self, ms: int) -> None:
@@ -131,6 +139,10 @@ class TimelineWidget(QWidget):
 
     def set_subtitle_rows(self, rows: list[tuple]) -> None:
         self._subtitle_rows = list(rows)
+        self.update()
+
+    def set_overlay_rows(self, rows: list[tuple]) -> None:
+        self._overlay_rows = list(rows)
         self.update()
 
     # ── Coordinate helpers ────────────────────────────────────────────── #
@@ -185,6 +197,22 @@ class TimelineWidget(QWidget):
                 return i, 'move'
         return None
 
+    def _ovl_block_at(self, x: int, y: int) -> tuple[int, str] | None:
+        """Return (row_index, mode) for the overlay block under (x,y), or None."""
+        if not (_OVL_Y <= y <= _OVL_Y + _OVL_H):
+            return None
+        for i, row in enumerate(self._overlay_rows):
+            start_ms, end_ms = row[0], row[1]
+            x1 = self._ms_to_x(start_ms)
+            x2 = self._ms_to_x(end_ms)
+            if x1 <= x <= x2:
+                if x - x1 <= self._EDGE_TOL:
+                    return i, 'left'
+                if x2 - x <= self._EDGE_TOL:
+                    return i, 'right'
+                return i, 'move'
+        return None
+
     def _nice_interval(self) -> int:
         v_s, v_e = self._visible_range()
         span = max(1, v_e - v_s) if self._duration > 0 else self._duration
@@ -222,6 +250,10 @@ class TimelineWidget(QWidget):
         p.drawText(QRect(0, _SUB_Y, _HEADER_W - 5, _SUB_H),
                    Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
                    "SUBS")
+        # OVER label
+        p.drawText(QRect(0, _OVL_Y, _HEADER_W - 5, _OVL_H),
+                   Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+                   "OVER")
 
         if self._duration <= 0:
             hint_font = QFont()
@@ -315,6 +347,29 @@ class TimelineWidget(QWidget):
                                Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
                                text[:20])
 
+        # ── Image overlay track ─────────────────────────────────────── #
+        ovl_rect = QRect(_HEADER_W, _OVL_Y, self._cw(), _OVL_H)
+        p.fillRect(ovl_rect, _C_OVL_BG)
+        p.setPen(QPen(QColor(55, 65, 80), 1))
+        p.drawRect(ovl_rect.adjusted(0, 0, -1, -1))
+
+        ovl_font = QFont()
+        ovl_font.setPointSize(7)
+        p.setFont(ovl_font)
+        for row in self._overlay_rows:
+            o_s, o_e = row[0], row[1]
+            o_path   = row[2] if len(row) > 2 else ""
+            x1 = max(_HEADER_W, self._ms_to_x(o_s))
+            x2 = min(w, self._ms_to_x(o_e))
+            if x2 > x1:
+                ob = QRect(x1, _OVL_Y + 2, x2 - x1, _OVL_H - 4)
+                p.fillRect(ob, QColor(255, 180, 60, 190))
+                if ob.width() > 22:
+                    p.setPen(QPen(QColor(60, 25, 0), 1))
+                    p.drawText(ob.adjusted(3, 0, -3, 0),
+                               Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+                               os.path.basename(o_path)[:22])
+
         # ── Cut markers ──────────────────────────────────────────────── #
         p.setFont(QFont())
         for i, sp in enumerate(self._splits):
@@ -387,6 +442,22 @@ class TimelineWidget(QWidget):
                     self.setCursor(QCursor(Qt.CursorShape.ClosedHandCursor))
                 return
 
+            # Overlay block drag/resize
+            ohit = self._ovl_block_at(x, y)
+            if ohit is not None:
+                row, mode = ohit
+                o_s, o_e = self._overlay_rows[row][0], self._overlay_rows[row][1]
+                self._ovl_drag = {
+                    'row': row,
+                    'mode': mode,
+                    'anchor_ms': self._x_to_ms(x),
+                    'orig_start': o_s,
+                    'orig_end': o_e,
+                }
+                if mode == 'move':
+                    self.setCursor(QCursor(Qt.CursorShape.ClosedHandCursor))
+                return
+
             idx = self._cut_at(x)
             if idx >= 0:
                 self.split_removed.emit(idx)
@@ -439,6 +510,25 @@ class TimelineWidget(QWidget):
             self.subtitle_moved.emit(drag['row'], new_s, new_e)
             return
 
+        if self._ovl_drag is not None:
+            cur_ms = self._x_to_ms(x)
+            drag = self._ovl_drag
+            delta = cur_ms - drag['anchor_ms']
+            mode = drag['mode']
+            o_s, o_e = drag['orig_start'], drag['orig_end']
+            dur = o_e - o_s
+            if mode == 'move':
+                new_s = max(0, min(self._duration - dur, o_s + delta))
+                new_e = new_s + dur
+            elif mode == 'left':
+                new_s = max(0, min(o_e - 50, o_s + delta))
+                new_e = o_e
+            else:  # right
+                new_s = o_s
+                new_e = max(o_s + 50, min(self._duration, o_e + delta))
+            self.overlay_moved.emit(drag['row'], new_s, new_e)
+            return
+
         if self._dragging:
             ms = self._x_to_ms(x)
             self._position = ms
@@ -454,8 +544,8 @@ class TimelineWidget(QWidget):
                     event.globalPosition().toPoint(),
                     f"Click to remove  ·  {_fmt_tc(self._splits[self._hovered_cut])}",
                 )
-            # Update cursor to hint subtitle block interactions
-            hit = self._sub_block_at(x, y)
+            # Update cursor to hint subtitle/overlay block interactions
+            hit = self._sub_block_at(x, y) or self._ovl_block_at(x, y)
             if hit is not None:
                 _, mode = hit
                 if mode in ('left', 'right'):
@@ -470,6 +560,9 @@ class TimelineWidget(QWidget):
             self._dragging = False
             if self._sub_drag is not None:
                 self._sub_drag = None
+                self.setCursor(QCursor(Qt.CursorShape.CrossCursor))
+            if self._ovl_drag is not None:
+                self._ovl_drag = None
                 self.setCursor(QCursor(Qt.CursorShape.CrossCursor))
 
     def wheelEvent(self, event) -> None:  # noqa: N802

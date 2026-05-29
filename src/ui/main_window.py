@@ -402,6 +402,9 @@ class MainWindow(QMainWindow):
         self.subtitle_editor.word_rows_updated.connect(self.player.set_word_rows)
         self.subtitle_editor.style_preview_changed.connect(self.player.set_subtitle_style)
 
+        # Subtitle drag on timeline → update editor table
+        self.timeline.subtitle_moved.connect(self.subtitle_editor.on_subtitle_moved)
+
         # Subtitle drag position → stored in editor for ASS export
         self.player.drag_position_changed.connect(self.subtitle_editor.set_drag_offset)
 

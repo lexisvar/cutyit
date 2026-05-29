@@ -656,6 +656,20 @@ class SubtitleEditorWidget(QWidget):
             if updated:
                 self.word_rows_updated.emit(list(self._word_rows))
 
+    def on_subtitle_moved(self, row: int, new_start_ms: int, new_end_ms: int) -> None:
+        """Called when the user drags/resizes a subtitle block on the timeline."""
+        if row < 0 or row >= self._table.rowCount():
+            return
+        self._populating = True
+        try:
+            self._table.item(row, self._COL_START).setText(_ms_to_srt(new_start_ms))
+            self._table.item(row, self._COL_END).setText(_ms_to_srt(new_end_ms))
+        finally:
+            self._populating = False
+        # Push updated rows to the live preview without going through _on_table_changed
+        rows = self._read_table_rows()
+        self.subtitles_updated.emit(rows)
+
     def _on_cell_double_clicked(self, row: int, col: int) -> None:
         # Jump to start time when double-clicking the index or start column
         if col in (self._COL_IDX, self._COL_START):

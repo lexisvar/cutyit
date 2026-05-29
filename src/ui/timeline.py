@@ -74,9 +74,10 @@ class TimelineWidget(QWidget):
     Public API is unchanged from the previous version so no callers need updating.
     """
 
-    position_changed = pyqtSignal(int)   # ms — user-initiated seek
-    split_added      = pyqtSignal(int)   # ms — new cut
-    split_removed    = pyqtSignal(int)   # index removed  (-1 = all cleared)
+    position_changed = pyqtSignal(int)      # ms — user-initiated seek
+    split_added      = pyqtSignal(int)      # ms — new cut
+    split_removed    = pyqtSignal(int)      # index removed  (-1 = all cleared)
+    subtitle_moved   = pyqtSignal(int, int, int)  # row, new_start_ms, new_end_ms
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -88,6 +89,7 @@ class TimelineWidget(QWidget):
         self._subtitle_rows: list[tuple] = []
         self._zoom       : float     = 1.0
         self._zoom_start : int       = 0
+        self._sub_drag   : dict | None = None  # subtitle drag/resize state
 
         self.setFixedHeight(_WIDGET_H)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
@@ -163,6 +165,25 @@ class TimelineWidget(QWidget):
             if abs(self._ms_to_x(sp) - x) <= tol:
                 return i
         return -1
+
+    _EDGE_TOL = 5
+
+    def _sub_block_at(self, x: int, y: int) -> tuple[int, str] | None:
+        """Return (row_index, mode) for the subtitle block under (x,y), or None.
+        mode is 'left' (resize left edge), 'right' (resize right edge), or 'move'.
+        """
+        if not (_SUB_Y <= y <= _SUB_Y + _SUB_H):
+            return None
+        for i, (start_ms, end_ms, _) in enumerate(self._subtitle_rows):
+            x1 = self._ms_to_x(start_ms)
+            x2 = self._ms_to_x(end_ms)
+            if x1 <= x <= x2:
+                if x - x1 <= self._EDGE_TOL:
+                    return i, 'left'
+                if x2 - x <= self._EDGE_TOL:
+                    return i, 'right'
+                return i, 'move'
+        return None
 
     def _nice_interval(self) -> int:
         v_s, v_e = self._visible_range()
@@ -347,9 +368,25 @@ class TimelineWidget(QWidget):
     def mousePressEvent(self, event) -> None:  # noqa: N802
         if self._duration == 0 or event.pos().x() < _HEADER_W:
             return
-        x = event.pos().x()
+        x, y = event.pos().x(), event.pos().y()
 
         if event.button() == Qt.MouseButton.LeftButton:
+            # Subtitle block drag/resize has priority over cut-marker click and seek
+            hit = self._sub_block_at(x, y)
+            if hit is not None:
+                row, mode = hit
+                start_ms, end_ms, _ = self._subtitle_rows[row]
+                self._sub_drag = {
+                    'row': row,
+                    'mode': mode,
+                    'anchor_ms': self._x_to_ms(x),
+                    'orig_start': start_ms,
+                    'orig_end': end_ms,
+                }
+                if mode == 'move':
+                    self.setCursor(QCursor(Qt.CursorShape.ClosedHandCursor))
+                return
+
             idx = self._cut_at(x)
             if idx >= 0:
                 self.split_removed.emit(idx)
@@ -379,9 +416,29 @@ class TimelineWidget(QWidget):
                 self.split_removed.emit(-1)
 
     def mouseMoveEvent(self, event) -> None:  # noqa: N802
-        x = event.pos().x()
+        x, y = event.pos().x(), event.pos().y()
         if x < _HEADER_W:
             return
+
+        if self._sub_drag is not None:
+            cur_ms = self._x_to_ms(x)
+            drag = self._sub_drag
+            delta = cur_ms - drag['anchor_ms']
+            mode = drag['mode']
+            o_s, o_e = drag['orig_start'], drag['orig_end']
+            dur = o_e - o_s
+            if mode == 'move':
+                new_s = max(0, min(self._duration - dur, o_s + delta))
+                new_e = new_s + dur
+            elif mode == 'left':
+                new_s = max(0, min(o_e - 50, o_s + delta))
+                new_e = o_e
+            else:  # right
+                new_s = o_s
+                new_e = max(o_s + 50, min(self._duration, o_e + delta))
+            self.subtitle_moved.emit(drag['row'], new_s, new_e)
+            return
+
         if self._dragging:
             ms = self._x_to_ms(x)
             self._position = ms
@@ -397,10 +454,23 @@ class TimelineWidget(QWidget):
                     event.globalPosition().toPoint(),
                     f"Click to remove  ·  {_fmt_tc(self._splits[self._hovered_cut])}",
                 )
+            # Update cursor to hint subtitle block interactions
+            hit = self._sub_block_at(x, y)
+            if hit is not None:
+                _, mode = hit
+                if mode in ('left', 'right'):
+                    self.setCursor(QCursor(Qt.CursorShape.SizeHorCursor))
+                else:
+                    self.setCursor(QCursor(Qt.CursorShape.OpenHandCursor))
+            else:
+                self.setCursor(QCursor(Qt.CursorShape.CrossCursor))
 
     def mouseReleaseEvent(self, event) -> None:  # noqa: N802
         if event.button() == Qt.MouseButton.LeftButton:
             self._dragging = False
+            if self._sub_drag is not None:
+                self._sub_drag = None
+                self.setCursor(QCursor(Qt.CursorShape.CrossCursor))
 
     def wheelEvent(self, event) -> None:  # noqa: N802
         if event.modifiers() & Qt.KeyboardModifier.MetaModifier:

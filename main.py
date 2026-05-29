@@ -3,9 +3,18 @@ import os
 import ctypes
 import ctypes.util
 
-from PyQt6.QtWidgets import QApplication, QMessageBox
-from PyQt6.QtCore import Qt
-from PyQt6.QtGui import QIcon
+try:
+    from PyQt6.QtWidgets import QApplication, QMessageBox
+    from PyQt6.QtCore import Qt
+    from PyQt6.QtGui import QIcon
+except ModuleNotFoundError:
+    print(
+        "\nPyQt6 not found. Run the app with the project's virtual environment:\n"
+        "  .venv/bin/python main.py\n"
+        "Or activate it first:\n"
+        "  source .venv/bin/activate && python main.py\n"
+    )
+    sys.exit(1)
 
 
 def _set_macos_dock_icon(png_path: str) -> None:

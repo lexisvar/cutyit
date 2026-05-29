@@ -91,6 +91,9 @@ class _TranscribeWorker(QThread):
                 self._proc.kill()
             except Exception:
                 pass
+        # ctranslate2 blocks Python in C++ code — terminate the thread immediately
+        # so the UI doesn't stay frozen waiting for the current segment to finish.
+        self.terminate()
 
     def run(self) -> None:
         tmp_audio: str | None = None
@@ -523,7 +526,12 @@ class SubtitleEditorWidget(QWidget):
     def _start_generation(self) -> None:
         # If already running, act as a stop button
         if self._worker is not None and self._worker.isRunning():
-            self._worker.stop()
+            self._worker.stop()          # sets flag + terminates thread
+            # Reset UI immediately — cancelled signal won't fire after terminate()
+            self._progress.setRange(0, 0)
+            self._progress.hide()
+            self._btn_generate.setText("⚙ Generate")
+            self._set_status("Transcription cancelled")
             return
         if not self._video_path:
             return

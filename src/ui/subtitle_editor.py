@@ -61,9 +61,10 @@ class _Seg(NamedTuple):
 # --------------------------------------------------------------------------- #
 
 class _TranscribeWorker(QThread):
-    finished = pyqtSignal(list)
-    error = pyqtSignal(str)
-    status = pyqtSignal(str)
+    finished  = pyqtSignal(list)
+    error     = pyqtSignal(str)
+    status    = pyqtSignal(str)
+    progress  = pyqtSignal(int)    # 0-100 transcription progress
     cancelled = pyqtSignal()
 
     def __init__(
@@ -135,7 +136,8 @@ class _TranscribeWorker(QThread):
             kwargs: dict = {"beam_size": 5, "word_timestamps": True}
             if self._language:
                 kwargs["language"] = self._language
-            raw, _ = model.transcribe(audio_path, **kwargs)
+            raw, info = model.transcribe(audio_path, **kwargs)
+            total_dur = (info.duration or 1.0) if info.duration and info.duration > 0 else 1.0
 
             # Offset timestamps back to original video time
             offset = self._start_ms / 1000.0
@@ -144,6 +146,8 @@ class _TranscribeWorker(QThread):
                 if self._stop:
                     self.cancelled.emit()
                     return
+                pct = int(min(99, seg.end / total_dur * 100))
+                self.progress.emit(pct)
                 words = []
                 if seg.words:
                     words = [
@@ -154,6 +158,7 @@ class _TranscribeWorker(QThread):
                     _Seg(start=seg.start + offset, end=seg.end + offset,
                          text=seg.text, words=words)
                 )
+            self.progress.emit(100)
             self.finished.emit(segments)
         except Exception as exc:
             self.error.emit(str(exc))
@@ -327,8 +332,9 @@ class SubtitleEditorWidget(QWidget):
         # Progress + status (very thin, hidden when idle)
         self._progress = QProgressBar()
         self._progress.setRange(0, 0)
-        self._progress.setTextVisible(False)
-        self._progress.setFixedHeight(3)
+        self._progress.setTextVisible(True)
+        self._progress.setFormat("%p %")
+        self._progress.setFixedHeight(14)
         self._progress.hide()
         layout.addWidget(self._progress)
 
@@ -538,18 +544,28 @@ class SubtitleEditorWidget(QWidget):
             self._video_path, model, language, start_ms, end_ms
         )
         self._worker.status.connect(self._set_status)
+        self._worker.progress.connect(self._on_transcribe_progress)
         self._worker.finished.connect(self._on_done)
         self._worker.error.connect(self._on_error)
         self._worker.cancelled.connect(self._on_cancelled)
         self._worker.start()
 
+    def _on_transcribe_progress(self, pct: int) -> None:
+        if self._progress.maximum() == 0:
+            # Switch from indeterminate to determinate on first real update
+            self._progress.setRange(0, 100)
+        self._progress.setValue(pct)
+        self._set_status(f"Transcribing…  {pct} %")
+
     def _on_cancelled(self) -> None:
+        self._progress.setRange(0, 0)
         self._progress.hide()
         self._btn_generate.setText("⚙ Generate")
         self._btn_generate.setEnabled(True)
         self._set_status("Transcription cancelled")
 
     def _on_done(self, segments: list) -> None:
+        self._progress.setRange(0, 0)
         self._progress.hide()
         self._btn_generate.setText("⚙ Generate")
         self._btn_generate.setEnabled(True)
@@ -575,6 +591,7 @@ class SubtitleEditorWidget(QWidget):
         self._btn_chunk.setEnabled(True)
 
     def _on_error(self, msg: str) -> None:
+        self._progress.setRange(0, 0)
         self._progress.hide()
         self._btn_generate.setText("⚙ Generate")
         self._btn_generate.setEnabled(True)

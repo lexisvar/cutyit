@@ -358,6 +358,34 @@ Advantages:
 - 🔲 Tactical moment detection
 - 🔲 AI zooms
 
+## Phase 4 — Clip Editor (In Progress)
+
+### Step 1 — Cut & Remove 🔲
+- Split points create visual clip segments on the video track
+- Click segment → mark as deleted (greyed out / excluded)
+- On export → FFmpeg concat skips excluded segments
+- Keyboard shortcut to toggle segment inclusion
+
+### Step 2 — Reorder Clips 🔲
+- Drag clip segments on the video track to change playback order
+- Timeline redraws sequence live
+- FFmpeg concat respects the new order on export
+
+### Step 3 — Join & Export 🔲
+- Export joined clip as a single video file
+- Optionally run transcription + subtitle pipeline on the joined clip
+
+### Step 4 — Subtitle Translation 🔲
+- Translate existing subtitle rows to a target language
+- `deep-translator` backend (Google Translate, no API key)
+- Worker thread pattern, per-row progress
+- Language dropdown in SubtitleEditorWidget
+
+### Step 5 — Transitions (Last) 🔲
+- Cross-fade, fade-to-black between clip segments
+- UI handles between segments to pick transition type/duration
+- FFmpeg `xfade` filter with precise offset calculation
+
 ---
 
 # Final Product Goal

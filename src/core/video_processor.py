@@ -343,3 +343,58 @@ def burn_image_overlays(
 
     if rc != 0:
         raise RuntimeError(f"FFmpeg overlay burn failed:\n{stderr}")
+
+
+def concat_segments(
+    input_path: str,
+    segments_ms: list[tuple[int, int]],
+    output_path: str,
+    on_progress: Callable[[int], None] | None = None,
+) -> None:
+    """Concatenate specific segments of a video into a single output file.
+
+    segments_ms: list of (start_ms, end_ms) pairs in playback order.
+    Uses stream-copy trim + concat demuxer — no re-encode, no quality loss.
+    """
+    import tempfile
+
+    if not segments_ms:
+        raise ValueError("No segments provided")
+
+    ext = os.path.splitext(input_path)[1]
+    n = len(segments_ms)
+    total_kept_s = max(1.0, sum(e - s for s, e in segments_ms) / 1000.0)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        # Step 1: stream-copy trim each segment to a temp file
+        seg_paths: list[str] = []
+        for idx, (start_ms, end_ms) in enumerate(segments_ms):
+            seg_path = os.path.join(tmp, f"seg_{idx:03d}{ext}")
+            trim_video(input_path, start_ms, end_ms, seg_path)
+            seg_paths.append(seg_path)
+            if on_progress:
+                on_progress(int((idx + 1) / n * 50))
+
+        # Step 2: write concat list
+        list_path = os.path.join(tmp, "concat.txt")
+        with open(list_path, "w", encoding="utf-8") as f:
+            for sp in seg_paths:
+                f.write(f"file '{sp}'\n")
+
+        # Step 3: concat with stream copy
+        concat_args = [
+            "-f", "concat", "-safe", "0", "-i", list_path,
+            "-c", "copy", output_path,
+        ]
+        if on_progress is not None:
+            rc, stderr = _run_ffmpeg_progress(
+                concat_args,
+                total_kept_s,
+                lambda pct: on_progress(50 + pct // 2),
+            )
+        else:
+            result = _run_ffmpeg(*concat_args)
+            rc, stderr = result.returncode, result.stderr
+
+        if rc != 0:
+            raise RuntimeError(f"FFmpeg concat failed:\n{stderr}")

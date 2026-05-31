@@ -122,6 +122,26 @@ class _DetectSilenceWorker(QThread):
             self.error.emit(str(exc))
 
 
+class _ConcatWorker(QThread):
+    progress = pyqtSignal(int)
+    finished = pyqtSignal(str)
+    error    = pyqtSignal(str)
+
+    def __init__(self, input_path: str, segments_ms: list, output_path: str) -> None:
+        super().__init__()
+        self._input    = input_path
+        self._segments = segments_ms
+        self._output   = output_path
+
+    def run(self) -> None:
+        try:
+            from src.core.video_processor import concat_segments  # noqa: PLC0415
+            concat_segments(self._input, self._segments, self._output, self.progress.emit)
+            self.finished.emit(self._output)
+        except Exception as exc:
+            self.error.emit(str(exc))
+
+
 # --------------------------------------------------------------------------- #
 #  Helpers                                                                     #
 # --------------------------------------------------------------------------- #
@@ -157,6 +177,8 @@ class MainWindow(QMainWindow):
         self._sub_worker: _SubExportWorker | None = None
         self._social_worker: _SocialExportWorker | None = None
         self._silence_worker: _DetectSilenceWorker | None = None
+        self._concat_worker: _ConcatWorker | None = None
+        self._excluded_segs: set[int] = set()
 
         self.setWindowTitle("Cutyit")
         self.setMinimumSize(1080, 660)
@@ -327,6 +349,16 @@ class MainWindow(QMainWindow):
         btn_row.addWidget(self._btn_export)
         lay.addLayout(btn_row)
 
+        # ── Join kept clips row ───────────────────────────────────────── #
+        self._btn_join = QPushButton("⬇ Join Kept Clips…")
+        self._btn_join.setObjectName("btn_primary")
+        self._btn_join.setEnabled(False)
+        self._btn_join.setFixedHeight(26)
+        self._btn_join.setToolTip(
+            "Export only the non-excluded clips joined into one file"
+        )
+        lay.addWidget(self._btn_join)
+
         # ── Social export row ─────────────────────────────────────────── #
         social_row = QHBoxLayout()
         social_row.setSpacing(5)
@@ -412,6 +444,7 @@ class MainWindow(QMainWindow):
 
         # Subtitle drag on timeline → update editor table
         self.timeline.subtitle_moved.connect(self.subtitle_editor.on_subtitle_moved)
+        self.timeline.segment_toggled.connect(self._on_segment_toggled)
 
         # Overlay panel ↔ timeline
         self.overlay_panel.overlays_changed.connect(self.timeline.set_overlay_rows)
@@ -468,6 +501,8 @@ class MainWindow(QMainWindow):
         self._btn_social.clicked.connect(self._export_social)
         # Silence detection
         self._btn_silence.clicked.connect(self._detect_silences)
+        # Join kept clips
+        self._btn_join.clicked.connect(self._join_kept_clips)
 
     # ------------------------------------------------------------------ #
     #  Slots — playback                                                    #
@@ -494,6 +529,10 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------ #
 
     def _on_split_changed(self, _=None) -> None:
+        # Splits changed → segment indices shift, so clear all exclusions
+        self._excluded_segs.clear()
+        self.timeline.set_excluded(set())
+        self._btn_join.setEnabled(False)
         self._refresh_split_list()
 
     def _add_split_here(self) -> None:
@@ -523,19 +562,74 @@ class MainWindow(QMainWindow):
 
     def _remove_selected_split(self) -> None:
         row = self._split_list.currentRow()
-        # row in the list == segment index; split index == row (since row 0 = "0 → sp[0]")
-        # We need to map segment row → split index
         splits = self.timeline.split_points()
-        # segments: [0..sp[0], sp[0]..sp[1], ..., sp[n-1]..dur]
-        # split idx for segment i = i - 1 (but segment 0 has no split before it)
-        # "Remove" actually removes the split BEFORE this segment (its left boundary)
-        # More intuitive: remove the right boundary of the selected segment
-        # i.e. split at index == row (segment 0's right split is splits[0], etc.)
         if 0 <= row < len(splits):
             self.timeline.remove_split(row)
             self._refresh_split_list()
 
+    def _on_segment_toggled(self, idx: int, excluded: bool) -> None:
+        if excluded:
+            self._excluded_segs.add(idx)
+        else:
+            self._excluded_segs.discard(idx)
+        self._refresh_split_list()
+        n_total = len(self.timeline.split_points()) + 1
+        kept = n_total - len(self._excluded_segs)
+        self._btn_join.setEnabled(
+            bool(self._video_path) and kept > 0 and bool(self._excluded_segs)
+        )
+
+    def _join_kept_clips(self) -> None:
+        if not self._video_path:
+            return
+        splits = self.timeline.split_points()
+        boundaries = [0] + splits + [self._duration]
+        segments_ms = [
+            (boundaries[i], boundaries[i + 1])
+            for i in range(len(boundaries) - 1)
+            if i not in self._excluded_segs
+        ]
+        if not segments_ms:
+            QMessageBox.warning(self, "No clips", "All clips are excluded. Nothing to join.")
+            return
+        base = os.path.splitext(os.path.basename(self._video_path))[0]
+        out_path, _ = QFileDialog.getSaveFileName(
+            self, "Save Joined Video", f"{base}_joined.mp4",
+            "MP4 Files (*.mp4);;All Files (*)",
+            options=QFileDialog.Option.DontUseNativeDialog,
+        )
+        if not out_path:
+            return
+        self._concat_worker = _ConcatWorker(self._video_path, segments_ms, out_path)
+        self._export_progress.setValue(0)
+        self._export_progress.show()
+        self._concat_worker.progress.connect(self._export_progress.setValue)
+        self._concat_worker.finished.connect(self._on_join_done)
+        self._concat_worker.error.connect(self._on_join_error)
+        self._btn_join.setEnabled(False)
+        self._status.showMessage(f"Joining {len(segments_ms)} clip(s)…")
+        self._concat_worker.start()
+
+    def _on_join_done(self, path: str) -> None:
+        self._export_progress.hide()
+        n_kept = len(self.timeline.split_points()) + 1 - len(self._excluded_segs)
+        self._btn_join.setEnabled(True)
+        self._status.showMessage(f"Joined → {path}")
+        QMessageBox.information(
+            self, "Export Complete",
+            f"Joined {n_kept} clip(s) saved to:\n{path}",
+        )
+
+    def _on_join_error(self, msg: str) -> None:
+        self._export_progress.hide()
+        self._status.showMessage(f"Join failed: {msg}")
+        n_total = len(self.timeline.split_points()) + 1
+        kept = n_total - len(self._excluded_segs)
+        self._btn_join.setEnabled(kept > 0 and bool(self._excluded_segs))
+
     def _refresh_split_list(self) -> None:
+        from PyQt6.QtWidgets import QListWidgetItem  # noqa: PLC0415
+        from PyQt6.QtGui import QColor as _QC        # noqa: PLC0415
         splits = self.timeline.split_points()
         self._split_list.clear()
         boundaries = [0] + splits + [self._duration]
@@ -543,9 +637,14 @@ class MainWindow(QMainWindow):
         for i in range(len(boundaries) - 1):
             s, e = boundaries[i], boundaries[i + 1]
             dur_label = _fmt_dur(e - s)
-            self._split_list.addItem(
-                f"  Clip {i + 1}   {_fmt(s)} → {_fmt(e)}  ·  {dur_label}"
+            excl = i in self._excluded_segs
+            prefix = "✕ " if excl else "  "
+            item = QListWidgetItem(
+                f"{prefix}Clip {i + 1}   {_fmt(s)} → {_fmt(e)}  ·  {dur_label}"
             )
+            if excl:
+                item.setForeground(_QC(180, 80, 80))
+            self._split_list.addItem(item)
             segs_info.append((s, e, f"Clip {i + 1}  ({_fmt(s)} – {_fmt(e)})"))
         n = len(boundaries) - 1
         self._lbl_seg_count.setText(f"{n} seg{'s' if n != 1 else ''}")
@@ -595,6 +694,8 @@ class MainWindow(QMainWindow):
         self._btn_silence.setEnabled(False)
 
         self._video_path = path
+        self._excluded_segs.clear()
+        self._btn_join.setEnabled(False)
         self.player.load(path)
         self.player.play()
         self.player.set_subtitle_rows([])          # clear previous overlay

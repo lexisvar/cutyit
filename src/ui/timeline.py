@@ -83,6 +83,7 @@ class TimelineWidget(QWidget):
     split_removed    = pyqtSignal(int)      # index removed  (-1 = all cleared)
     subtitle_moved   = pyqtSignal(int, int, int)  # row, new_start_ms, new_end_ms
     overlay_moved    = pyqtSignal(int, int, int)  # row, new_start_ms, new_end_ms
+    segment_toggled  = pyqtSignal(int, bool)       # seg_index, is_excluded
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -97,6 +98,7 @@ class TimelineWidget(QWidget):
         self._sub_drag   : dict | None = None  # subtitle drag/resize state
         self._overlay_rows: list[tuple] = []
         self._ovl_drag   : dict | None = None  # overlay drag/resize state
+        self._excluded   : set[int]    = set() # excluded clip segment indices
 
         self.setFixedHeight(_WIDGET_H)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
@@ -113,6 +115,7 @@ class TimelineWidget(QWidget):
         self._zoom_start = 0
         self._subtitle_rows = []
         self._overlay_rows  = []
+        self._excluded      = set()
         self.update()
 
     def set_position(self, ms: int) -> None:
@@ -143,6 +146,13 @@ class TimelineWidget(QWidget):
 
     def set_overlay_rows(self, rows: list[tuple]) -> None:
         self._overlay_rows = list(rows)
+        self.update()
+
+    def excluded_segments(self) -> set[int]:
+        return set(self._excluded)
+
+    def set_excluded(self, excluded: set[int]) -> None:
+        self._excluded = set(excluded)
         self.update()
 
     # ── Coordinate helpers ────────────────────────────────────────────── #
@@ -212,6 +222,19 @@ class TimelineWidget(QWidget):
                     return i, 'right'
                 return i, 'move'
         return None
+
+    def _seg_at(self, x: int, y: int) -> int:
+        """Return 0-based segment index under (x, y) in the video track, or -1."""
+        if not (_VIDEO_Y <= y <= _VIDEO_Y + _VIDEO_H):
+            return -1
+        if self._duration == 0:
+            return -1
+        ms = self._x_to_ms(x)
+        bounds = [0] + self._splits + [self._duration]
+        for i in range(len(bounds) - 1):
+            if bounds[i] <= ms <= bounds[i + 1]:
+                return i
+        return -1
 
     def _nice_interval(self) -> int:
         v_s, v_e = self._visible_range()
@@ -303,25 +326,40 @@ class TimelineWidget(QWidget):
             x2 = min(w, self._ms_to_x(bounds[i + 1]))
             if x2 <= x1 + 1:
                 continue
+            excluded = i in self._excluded
             base = _SEG_COLORS[i % len(_SEG_COLORS)]
             seg_r = QRect(x1 + 1, _VIDEO_Y + 2, x2 - x1 - 2, _VIDEO_H - 4)
-            # vertical gradient: slightly lighter top
-            grad = QLinearGradient(
-                float(seg_r.left()), float(seg_r.top()),
-                float(seg_r.left()), float(seg_r.bottom())
-            )
-            light = QColor(min(255, base.red() + 30),
-                           min(255, base.green() + 30),
-                           min(255, base.blue() + 30), 210)
-            grad.setColorAt(0.0, light)
-            grad.setColorAt(1.0, QColor(base.red(), base.green(), base.blue(), 180))
-            p.fillRect(seg_r, grad)
+            if excluded:
+                p.fillRect(seg_r, QColor(45, 32, 32, 230))
+                p.setPen(QPen(QColor(180, 60, 60, 160), 1))
+                p.drawLine(seg_r.topLeft(), seg_r.bottomRight())
+                p.drawLine(seg_r.topRight(), seg_r.bottomLeft())
+                p.setPen(QPen(QColor(180, 80, 80, 220), 1))
+                p.drawRect(seg_r)
+            else:
+                # vertical gradient: slightly lighter top
+                grad = QLinearGradient(
+                    float(seg_r.left()), float(seg_r.top()),
+                    float(seg_r.left()), float(seg_r.bottom())
+                )
+                light = QColor(min(255, base.red() + 30),
+                               min(255, base.green() + 30),
+                               min(255, base.blue() + 30), 210)
+                grad.setColorAt(0.0, light)
+                grad.setColorAt(1.0, QColor(base.red(), base.green(), base.blue(), 180))
+                p.fillRect(seg_r, grad)
             if seg_r.width() > 30:
                 p.setFont(clip_font)
-                p.setPen(QPen(QColor(255, 255, 255, 210), 1))
-                p.drawText(seg_r.adjusted(4, 0, -4, 0),
-                           Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
-                           f"Clip {i + 1}")
+                if excluded:
+                    p.setPen(QPen(QColor(200, 100, 100, 200), 1))
+                    p.drawText(seg_r.adjusted(4, 0, -4, 0),
+                               Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+                               f"✕ Clip {i + 1}")
+                else:
+                    p.setPen(QPen(QColor(255, 255, 255, 210), 1))
+                    p.drawText(seg_r.adjusted(4, 0, -4, 0),
+                               Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+                               f"Clip {i + 1}")
 
         p.setPen(QPen(QColor(55, 65, 80), 1))
         p.drawRect(vt_rect.adjusted(0, 0, -1, -1))
@@ -470,15 +508,31 @@ class TimelineWidget(QWidget):
                 self.update()
 
         elif event.button() == Qt.MouseButton.RightButton:
-            ms   = self._x_to_ms(x)
-            menu = QMenu(self)
+            ms      = self._x_to_ms(x)
+            menu    = QMenu(self)
+            seg_idx = self._seg_at(x, y)
+            act_toggle = None
+            if seg_idx >= 0:
+                if seg_idx in self._excluded:
+                    act_toggle = menu.addAction(f"✓ Include Clip {seg_idx + 1}")
+                else:
+                    act_toggle = menu.addAction(f"✕ Exclude Clip {seg_idx + 1}")
+                menu.addSeparator()
             act_add   = menu.addAction(f"Add cut at {_fmt_tc(ms)}")
             act_clear = None
             if self._splits:
                 menu.addSeparator()
                 act_clear = menu.addAction("Clear all cuts")
             action = menu.exec(event.globalPosition().toPoint())
-            if action == act_add:
+            if act_toggle and action == act_toggle:
+                if seg_idx in self._excluded:
+                    self._excluded.discard(seg_idx)
+                    self.segment_toggled.emit(seg_idx, False)
+                else:
+                    self._excluded.add(seg_idx)
+                    self.segment_toggled.emit(seg_idx, True)
+                self.update()
+            elif action == act_add:
                 self.add_split(ms)
                 self.split_added.emit(ms)
             elif act_clear and action == act_clear:

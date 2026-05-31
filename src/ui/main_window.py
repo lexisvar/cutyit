@@ -861,10 +861,10 @@ class MainWindow(QMainWindow):
     def _save_project(self) -> None:
         if not self._video_path:
             return
-        default = os.path.splitext(self._video_path)[0] + ".cutyit"
+        default = os.path.splitext(self._video_path)[0] + ".cyt"
         path, _ = QFileDialog.getSaveFileName(
             self, "Save Project", default,
-            "Cutyit Project (*.cutyit);;All Files (*)",
+            "Cutyit Project (*.cyt);;All Files (*)",
             options=QFileDialog.Option.DontUseNativeDialog,
         )
         if not path:
@@ -894,7 +894,7 @@ class MainWindow(QMainWindow):
     def _open_project(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
             self, "Open Project", QDir.homePath(),
-            "Cutyit Project (*.cutyit);;All Files (*)",
+            "Cutyit Project (*.cyt);;All Files (*)",
             options=QFileDialog.Option.DontUseNativeDialog,
         )
         if not path:

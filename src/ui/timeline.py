@@ -84,6 +84,7 @@ class TimelineWidget(QWidget):
     subtitle_moved   = pyqtSignal(int, int, int)  # row, new_start_ms, new_end_ms
     overlay_moved    = pyqtSignal(int, int, int)  # row, new_start_ms, new_end_ms
     segment_toggled  = pyqtSignal(int, bool)       # seg_index, is_excluded
+    clip_reordered   = pyqtSignal(list)             # new clip order [source_idx, ...]
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -99,6 +100,8 @@ class TimelineWidget(QWidget):
         self._overlay_rows: list[tuple] = []
         self._ovl_drag   : dict | None = None  # overlay drag/resize state
         self._excluded   : set[int]    = set() # excluded clip segment indices
+        self._clip_order : list[int]   = []    # output-position → source-segment mapping
+        self._seg_drag   : dict | None = None  # drag-to-reorder state
 
         self.setFixedHeight(_WIDGET_H)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
@@ -116,6 +119,8 @@ class TimelineWidget(QWidget):
         self._subtitle_rows = []
         self._overlay_rows  = []
         self._excluded      = set()
+        self._clip_order    = []
+        self._seg_drag      = None
         self.update()
 
     def set_position(self, ms: int) -> None:
@@ -153,6 +158,13 @@ class TimelineWidget(QWidget):
 
     def set_excluded(self, excluded: set[int]) -> None:
         self._excluded = set(excluded)
+        self.update()
+
+    def clip_order(self) -> list[int]:
+        return list(self._clip_order)
+
+    def set_clip_order(self, order: list[int]) -> None:
+        self._clip_order = list(order)
         self.update()
 
     # ── Coordinate helpers ────────────────────────────────────────────── #
@@ -317,11 +329,34 @@ class TimelineWidget(QWidget):
         p.fillRect(vt_rect, _C_TRACK_BG)
 
         bounds = [0] + self._splits + [self._duration]
+        n_segs = len(bounds) - 1
+
+        # ── Clip-order drag preview ───────────────────────────────────── #
+        drag_src = -1
+        drag_tgt = -1
+        if self._seg_drag and self._seg_drag.get('dragging'):
+            drag_src = self._seg_drag['seg']
+            drag_tgt = self._seg_drag['target']
+        eff_order = (list(self._clip_order) if len(self._clip_order) == n_segs
+                     else list(range(n_segs)))
+        if drag_src >= 0 and drag_tgt >= 0 and drag_src != drag_tgt:
+            try:
+                pa = eff_order.index(drag_src)
+                pb = eff_order.index(drag_tgt)
+                eff_order[pa], eff_order[pb] = eff_order[pb], eff_order[pa]
+            except ValueError:
+                pass
+        order_modified = (eff_order != list(range(n_segs)))
+        out_of = [i + 1 for i in range(n_segs)]  # default: identity
+        for out_pos, src in enumerate(eff_order):
+            if 0 <= src < n_segs:
+                out_of[src] = out_pos + 1
+
         clip_font = QFont()
         clip_font.setPointSize(8)
         clip_font.setBold(True)
 
-        for i in range(len(bounds) - 1):
+        for i in range(n_segs):
             x1 = max(_HEADER_W, self._ms_to_x(bounds[i]))
             x2 = min(w, self._ms_to_x(bounds[i + 1]))
             if x2 <= x1 + 1:
@@ -348,18 +383,28 @@ class TimelineWidget(QWidget):
                 grad.setColorAt(0.0, light)
                 grad.setColorAt(1.0, QColor(base.red(), base.green(), base.blue(), 180))
                 p.fillRect(seg_r, grad)
+            # Drag highlight borders
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            if i == drag_src:
+                p.setPen(QPen(QColor(255, 255, 255, 210), 2))
+                p.drawRect(seg_r.adjusted(1, 1, -1, -1))
+            elif i == drag_tgt:
+                p.setPen(QPen(QColor(255, 220, 50, 210), 2))
+                p.drawRect(seg_r.adjusted(1, 1, -1, -1))
             if seg_r.width() > 30:
                 p.setFont(clip_font)
                 if excluded:
                     p.setPen(QPen(QColor(200, 100, 100, 200), 1))
-                    p.drawText(seg_r.adjusted(4, 0, -4, 0),
-                               Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
-                               f"✕ Clip {i + 1}")
+                    lbl = f"✕ Clip {i + 1}"
+                elif order_modified:
+                    p.setPen(QPen(QColor(255, 255, 255, 210), 1))
+                    lbl = f"Clip {i + 1}  \u2192{out_of[i]}"
                 else:
                     p.setPen(QPen(QColor(255, 255, 255, 210), 1))
-                    p.drawText(seg_r.adjusted(4, 0, -4, 0),
-                               Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
-                               f"Clip {i + 1}")
+                    lbl = f"Clip {i + 1}"
+                p.drawText(seg_r.adjusted(4, 0, -4, 0),
+                           Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+                           lbl)
 
         p.setPen(QPen(QColor(55, 65, 80), 1))
         p.drawRect(vt_rect.adjusted(0, 0, -1, -1))
@@ -501,6 +546,13 @@ class TimelineWidget(QWidget):
                 self.split_removed.emit(idx)
                 self.remove_split(idx)
             else:
+                # Record potential clip drag (converted to real drag on sufficient movement)
+                seg_idx = self._seg_at(x, y)
+                if seg_idx >= 0:
+                    self._seg_drag = {
+                        'seg': seg_idx, 'start_x': x,
+                        'target': seg_idx, 'dragging': False,
+                    }
                 self._dragging = True
                 ms = self._x_to_ms(x)
                 self._position = ms
@@ -583,6 +635,19 @@ class TimelineWidget(QWidget):
             self.overlay_moved.emit(drag['row'], new_s, new_e)
             return
 
+        # Clip drag-to-reorder
+        if self._seg_drag is not None:
+            if not self._seg_drag['dragging'] and abs(x - self._seg_drag['start_x']) > 6:
+                self._seg_drag['dragging'] = True
+                self._dragging = False  # take over from playhead scrub
+                self.setCursor(QCursor(Qt.CursorShape.ClosedHandCursor))
+            if self._seg_drag['dragging']:
+                t = self._seg_at(x, _VIDEO_Y + _VIDEO_H // 2)
+                if t >= 0:
+                    self._seg_drag['target'] = t
+                self.update()
+                return
+
         if self._dragging:
             ms = self._x_to_ms(x)
             self._position = ms
@@ -618,6 +683,24 @@ class TimelineWidget(QWidget):
             if self._ovl_drag is not None:
                 self._ovl_drag = None
                 self.setCursor(QCursor(Qt.CursorShape.CrossCursor))
+            if self._seg_drag is not None:
+                d = self._seg_drag
+                if d['dragging'] and d['target'] != d['seg']:
+                    n = len(self._splits) + 1
+                    order = (list(self._clip_order) if len(self._clip_order) == n
+                             else list(range(n)))
+                    try:
+                        pa = order.index(d['seg'])
+                        pb = order.index(d['target'])
+                        order[pa], order[pb] = order[pb], order[pa]
+                    except ValueError:
+                        pass
+                    else:
+                        self._clip_order = order
+                        self.clip_reordered.emit(list(order))
+                self._seg_drag = None
+                self.setCursor(QCursor(Qt.CursorShape.CrossCursor))
+                self.update()
 
     def wheelEvent(self, event) -> None:  # noqa: N802
         if event.modifiers() & Qt.KeyboardModifier.MetaModifier:

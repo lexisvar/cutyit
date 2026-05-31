@@ -92,6 +92,17 @@ class OverlayPanel(QWidget):
         self._refresh_list()
         self.overlays_changed.emit(list(self._overlays))
 
+    def get_overlays(self) -> list[tuple]:
+        """Return current overlay list as [(start_ms, end_ms, path), ...]."""
+        return list(self._overlays)
+
+    def load_overlays(self, overlays: list[tuple]) -> None:
+        """Replace overlay list and emit overlays_changed."""
+        self._overlays = [(int(s), int(e), str(path)) for s, e, path in overlays]
+        self._refresh_list()
+        self._update_burn_btn()
+        self.overlays_changed.emit(list(self._overlays))
+
     # ── Build UI ──────────────────────────────────────────────────────── #
 
     def _build_ui(self) -> None:

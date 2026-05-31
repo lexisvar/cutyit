@@ -1,4 +1,5 @@
 import os
+import json
 
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QSplitter, QVBoxLayout, QHBoxLayout,
@@ -179,9 +180,11 @@ class MainWindow(QMainWindow):
         self._silence_worker: _DetectSilenceWorker | None = None
         self._concat_worker: _ConcatWorker | None = None
         self._excluded_segs: set[int] = set()
-        self._undo_stack: list[tuple] = []   # (splits, excluded) snapshots
+        self._clip_order: list[int] = []
+        self._undo_stack: list[tuple] = []   # (splits, excluded, clip_order) snapshots
         self._redo_stack: list[tuple] = []
         self._splits_snapshot: list[int] = []
+        self._pending_project: dict | None = None
 
         self.setWindowTitle("Cutyit")
         self.setMinimumSize(1080, 660)
@@ -404,6 +407,17 @@ class MainWindow(QMainWindow):
 
         tb.addSeparator()
 
+        act_open_proj = QAction(" Open Project… ", self)
+        act_open_proj.triggered.connect(self._open_project)
+        tb.addAction(act_open_proj)
+
+        self._act_save_proj = QAction(" Save Project ", self)
+        self._act_save_proj.setEnabled(False)
+        self._act_save_proj.triggered.connect(self._save_project)
+        tb.addAction(self._act_save_proj)
+
+        tb.addSeparator()
+
         self._act_export = QAction(" Export Clips… ", self)
         self._act_export.setEnabled(False)
         self._act_export.triggered.connect(self._export_segments)
@@ -448,6 +462,7 @@ class MainWindow(QMainWindow):
         # Subtitle drag on timeline → update editor table
         self.timeline.subtitle_moved.connect(self.subtitle_editor.on_subtitle_moved)
         self.timeline.segment_toggled.connect(self._on_segment_toggled)
+        self.timeline.clip_reordered.connect(self._on_clip_reordered)
 
         # Overlay panel ↔ timeline
         self.overlay_panel.overlays_changed.connect(self.timeline.set_overlay_rows)
@@ -525,6 +540,9 @@ class MainWindow(QMainWindow):
         self._btn_auto_split.setEnabled(True)
         self._btn_silence.setEnabled(True)
         self._refresh_split_list()
+        if self._pending_project is not None:
+            self._restore_project_state(self._pending_project)
+            self._pending_project = None
 
     def _update_split_btn(self, ms: int) -> None:
         if self._video_path:
@@ -552,6 +570,8 @@ class MainWindow(QMainWindow):
         self._push_undo_state_from_snapshot()
         self._excluded_segs.clear()
         self.timeline.set_excluded(set())
+        self._clip_order = []
+        self.timeline.set_clip_order([])
         self._btn_join.setEnabled(False)
         if idx == -1:
             # clear-all: splits already gone
@@ -569,21 +589,29 @@ class MainWindow(QMainWindow):
 
     def _push_undo_state_from_snapshot(self) -> None:
         """Push the current snapshot (pre-operation state) onto the undo stack."""
-        self._undo_stack.append((list(self._splits_snapshot), set(self._excluded_segs)))
+        self._undo_stack.append((
+            list(self._splits_snapshot),
+            set(self._excluded_segs),
+            list(self._clip_order),
+        ))
         self._redo_stack.clear()
         if len(self._undo_stack) > 50:
             self._undo_stack.pop(0)
 
-    def _apply_state(self, splits: list, excluded: set) -> None:
-        """Restore a (splits, excluded) snapshot without touching either undo stack."""
+    def _apply_state(self, splits: list, excluded: set, clip_order: list | None = None) -> None:
+        """Restore a (splits, excluded, clip_order) snapshot without touching either undo stack."""
         self.timeline.clear_splits()
         for ms in sorted(splits):
             self.timeline.add_split(ms)
         self._excluded_segs = set(excluded)
         self.timeline.set_excluded(excluded)
-        n_total = len(splits) + 1
-        kept = n_total - len(excluded)
-        self._btn_join.setEnabled(bool(self._video_path) and kept > 0 and bool(excluded))
+        self._clip_order = list(clip_order) if clip_order else []
+        self.timeline.set_clip_order(self._clip_order)
+        is_reordered = (bool(self._clip_order)
+                        and self._clip_order != list(range(len(self._clip_order))))
+        self._btn_join.setEnabled(
+            bool(self._video_path) and (bool(excluded) or is_reordered)
+        )
         self._splits_snapshot = list(self.timeline.split_points())
         self._refresh_split_list()
 
@@ -591,7 +619,11 @@ class MainWindow(QMainWindow):
         if not self._undo_stack:
             self._status.showMessage("Nothing to undo")
             return
-        self._redo_stack.append((list(self.timeline.split_points()), set(self._excluded_segs)))
+        self._redo_stack.append((
+            list(self.timeline.split_points()),
+            set(self._excluded_segs),
+            list(self._clip_order),
+        ))
         self._apply_state(*self._undo_stack.pop())
         self._status.showMessage("Undo")
 
@@ -599,7 +631,11 @@ class MainWindow(QMainWindow):
         if not self._redo_stack:
             self._status.showMessage("Nothing to redo")
             return
-        self._undo_stack.append((list(self.timeline.split_points()), set(self._excluded_segs)))
+        self._undo_stack.append((
+            list(self.timeline.split_points()),
+            set(self._excluded_segs),
+            list(self._clip_order),
+        ))
         self._apply_state(*self._redo_stack.pop())
         self._status.showMessage("Redo")
 
@@ -610,6 +646,8 @@ class MainWindow(QMainWindow):
         if 0 < pos < self._duration:
             self._push_undo_state_from_snapshot()
             self.timeline.add_split(pos)
+            self._clip_order = []
+            self.timeline.set_clip_order([])
             self._splits_snapshot = list(self.timeline.split_points())
             self._refresh_split_list()
 
@@ -626,6 +664,8 @@ class MainWindow(QMainWindow):
             added += 1
             t += interval_ms
         if added:
+            self._clip_order = []
+            self.timeline.set_clip_order([])
             self._splits_snapshot = list(self.timeline.split_points())
             self._refresh_split_list()
         self._status.showMessage(
@@ -638,6 +678,8 @@ class MainWindow(QMainWindow):
         if 0 <= row < len(splits):
             self._push_undo_state_from_snapshot()
             self.timeline.remove_split(row)
+            self._clip_order = []
+            self.timeline.set_clip_order([])
             self._splits_snapshot = list(self.timeline.split_points())
             self._refresh_split_list()
 
@@ -654,15 +696,31 @@ class MainWindow(QMainWindow):
             bool(self._video_path) and kept > 0 and bool(self._excluded_segs)
         )
 
+    def _on_clip_reordered(self, order: list[int]) -> None:
+        """Timeline drag-to-reorder finished — update clip order and enable join."""
+        self._push_undo_state_from_snapshot()
+        self._clip_order = list(order)
+        self._splits_snapshot = list(self.timeline.split_points())
+        is_reordered = self._clip_order != list(range(len(self._clip_order)))
+        if is_reordered:
+            self._btn_join.setEnabled(True)
+        self._refresh_split_list()
+        self._status.showMessage(
+            "Clips reordered — use ⬇ Join Kept Clips to export in the new order"
+        )
+
     def _join_kept_clips(self) -> None:
         if not self._video_path:
             return
         splits = self.timeline.split_points()
         boundaries = [0] + splits + [self._duration]
+        n_segs = len(boundaries) - 1
+        order = (self._clip_order if len(self._clip_order) == n_segs
+                 else list(range(n_segs)))
         segments_ms = [
-            (boundaries[i], boundaries[i + 1])
-            for i in range(len(boundaries) - 1)
-            if i not in self._excluded_segs
+            (boundaries[src], boundaries[src + 1])
+            for src in order
+            if src not in self._excluded_segs
         ]
         if not segments_ms:
             QMessageBox.warning(self, "No clips", "All clips are excluded. Nothing to join.")
@@ -756,7 +814,11 @@ class MainWindow(QMainWindow):
         )
         if not path:
             return
+        self._pending_project = None
+        self._do_load_video(path)
 
+    def _do_load_video(self, path: str) -> None:
+        """Load a video file; restore project state afterwards if _pending_project is set."""
         # Terminate any running background workers so the UI cannot lock up
         for _w in (self._sub_worker, self._split_worker,
                    self._social_worker, self._silence_worker):
@@ -770,6 +832,7 @@ class MainWindow(QMainWindow):
 
         self._video_path = path
         self._excluded_segs.clear()
+        self._clip_order = []
         self._btn_join.setEnabled(False)
         self._undo_stack.clear()
         self._redo_stack.clear()
@@ -787,8 +850,101 @@ class MainWindow(QMainWindow):
         self._lbl_filename.setText(f"📄  {name}")
         self._update_meta_label(path)
         self._info_bar.show()
+        self._act_save_proj.setEnabled(True)
         self.setWindowTitle(f"Cutyit — {name}")
         self._status.showMessage(f"Opened: {path}")
+
+    # ------------------------------------------------------------------ #
+    #  Project save / open                                                 #
+    # ------------------------------------------------------------------ #
+
+    def _save_project(self) -> None:
+        if not self._video_path:
+            return
+        default = os.path.splitext(self._video_path)[0] + ".cutyit"
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save Project", default,
+            "Cutyit Project (*.cutyit);;All Files (*)",
+            options=QFileDialog.Option.DontUseNativeDialog,
+        )
+        if not path:
+            return
+        subs = self.subtitle_editor.get_subtitle_rows()
+        overlays = self.overlay_panel.get_overlays()
+        data = {
+            "version": "1",
+            "video_path": self._video_path,
+            "splits": self.timeline.split_points(),
+            "excluded_segs": sorted(self._excluded_segs),
+            "clip_order": list(self._clip_order),
+            "subtitles": [
+                {"start_ms": s, "end_ms": e, "text": t} for s, e, t in subs
+            ],
+            "overlays": [
+                {"start_ms": s, "end_ms": e, "path": p} for s, e, p in overlays
+            ],
+        }
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+            self._status.showMessage(f"Project saved: {os.path.basename(path)}")
+        except Exception as exc:
+            QMessageBox.critical(self, "Save Error", str(exc))
+
+    def _open_project(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Open Project", QDir.homePath(),
+            "Cutyit Project (*.cutyit);;All Files (*)",
+            options=QFileDialog.Option.DontUseNativeDialog,
+        )
+        if not path:
+            return
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception as exc:
+            QMessageBox.critical(self, "Open Error", f"Cannot read project:\n{exc}")
+            return
+        video_path = data.get("video_path", "")
+        if not os.path.isfile(video_path):
+            QMessageBox.warning(
+                self, "Video not found",
+                f"The video file was not found:\n{video_path}\n\n"
+                "The project will open but playback may not work.",
+            )
+        self._pending_project = data
+        self._do_load_video(video_path)
+
+    def _restore_project_state(self, data: dict) -> None:
+        """Restore project state after the video duration is known."""
+        for ms in data.get("splits", []):
+            self.timeline.add_split(int(ms))
+        self._splits_snapshot = list(self.timeline.split_points())
+
+        self._excluded_segs = set(data.get("excluded_segs", []))
+        self.timeline.set_excluded(self._excluded_segs)
+
+        self._clip_order = list(data.get("clip_order", []))
+        self.timeline.set_clip_order(self._clip_order)
+
+        is_reordered = (bool(self._clip_order)
+                        and self._clip_order != list(range(len(self._clip_order))))
+        self._btn_join.setEnabled(bool(self._excluded_segs) or is_reordered)
+
+        subs = data.get("subtitles", [])
+        if subs:
+            rows = [(s["start_ms"], s["end_ms"], s["text"]) for s in subs]
+            self.subtitle_editor.load_subtitle_rows(rows)
+            self.player.set_subtitle_rows(rows)
+
+        overlays = data.get("overlays", [])
+        if overlays:
+            self.overlay_panel.load_overlays(
+                [(o["start_ms"], o["end_ms"], o["path"]) for o in overlays]
+            )
+
+        self._refresh_split_list()
+        self._status.showMessage("Project loaded")
 
     def _update_meta_label(self, path: str) -> None:
         try:
@@ -971,6 +1127,8 @@ class MainWindow(QMainWindow):
                 self.timeline.add_split(mid_ms)
                 added += 1
         if added:
+            self._clip_order = []
+            self.timeline.set_clip_order([])
             self._splits_snapshot = list(self.timeline.split_points())
             self._refresh_split_list()
         self._status.showMessage(

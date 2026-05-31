@@ -519,6 +519,24 @@ class SubtitleEditorWidget(QWidget):
         self._scope_cb.setCurrentIndex(idx)
         self._scope_cb.blockSignals(False)
 
+    def get_subtitle_rows(self) -> list[tuple]:
+        """Return current subtitle rows as [(start_ms, end_ms, text), ...]."""
+        if self._table.rowCount() == 0:
+            return []
+        return self._read_table_rows()
+
+    def load_subtitle_rows(self, rows: list[tuple]) -> None:
+        """Load subtitle rows into the table and emit subtitles_updated."""
+        self._populate_table(rows)
+        self._word_rows = []
+        has = bool(rows)
+        self.subtitles_updated.emit(rows)
+        self._btn_save_srt.setEnabled(has)
+        self._btn_save_vtt.setEnabled(has)
+        self._btn_embed.setEnabled(has)
+        self._btn_burn.setEnabled(has)
+        self._btn_chunk.setEnabled(has)
+
     # ------------------------------------------------------------------ #
     #  Generation                                                          #
     # ------------------------------------------------------------------ #

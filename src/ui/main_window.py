@@ -6,7 +6,7 @@ from PyQt6.QtWidgets import (
     QPushButton, QLabel, QTabWidget, QStatusBar, QSizePolicy, QFrame,
     QSpinBox, QProgressBar, QScrollArea,
 )
-from PyQt6.QtCore import Qt, QThread, QDir, pyqtSignal
+from PyQt6.QtCore import Qt, QThread, QDir, pyqtSignal, QTimer
 from PyQt6.QtGui import QAction, QKeySequence, QShortcut
 
 from src.ui.subtitle_overlay import SubtitleOverlayPlayer
@@ -179,6 +179,9 @@ class MainWindow(QMainWindow):
         self._silence_worker: _DetectSilenceWorker | None = None
         self._concat_worker: _ConcatWorker | None = None
         self._excluded_segs: set[int] = set()
+        self._undo_stack: list[tuple] = []   # (splits, excluded) snapshots
+        self._redo_stack: list[tuple] = []
+        self._splits_snapshot: list[int] = []
 
         self.setWindowTitle("Cutyit")
         self.setMinimumSize(1080, 660)
@@ -422,8 +425,8 @@ class MainWindow(QMainWindow):
 
         # Timeline → player seek
         self.timeline.position_changed.connect(self.player.seek)
-        self.timeline.split_added.connect(self._on_split_changed)
-        self.timeline.split_removed.connect(self._on_split_changed)
+        self.timeline.split_added.connect(self._on_split_added)
+        self.timeline.split_removed.connect(self._on_split_removed)
 
         # Split tab
         self._btn_add_split.clicked.connect(self._add_split_here)
@@ -503,6 +506,9 @@ class MainWindow(QMainWindow):
         self._btn_silence.clicked.connect(self._detect_silences)
         # Join kept clips
         self._btn_join.clicked.connect(self._join_kept_clips)
+        # Undo / Redo
+        QShortcut(QKeySequence.StandardKey.Undo, self).activated.connect(self._undo)
+        QShortcut(QKeySequence.StandardKey.Redo, self).activated.connect(self._redo)
 
     # ------------------------------------------------------------------ #
     #  Slots — playback                                                    #
@@ -529,24 +535,89 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------ #
 
     def _on_split_changed(self, _=None) -> None:
-        # Splits changed → segment indices shift, so clear all exclusions
+        # Kept for backward compatibility; routes to _on_split_removed
+        self._on_split_removed(-1)
+
+    def _on_split_added(self, ms: int) -> None:
+        """Timeline right-click ‘Add cut’ — split already added when signal fires."""
+        self._push_undo_state_from_snapshot()
         self._excluded_segs.clear()
         self.timeline.set_excluded(set())
         self._btn_join.setEnabled(False)
+        self._splits_snapshot = list(self.timeline.split_points())
         self._refresh_split_list()
+
+    def _on_split_removed(self, idx: int) -> None:
+        """Timeline cut removed (click on marker, or clear-all from right-click)."""
+        self._push_undo_state_from_snapshot()
+        self._excluded_segs.clear()
+        self.timeline.set_excluded(set())
+        self._btn_join.setEnabled(False)
+        if idx == -1:
+            # clear-all: splits already gone
+            self._splits_snapshot = []
+        else:
+            # single removal: split still present now (emit happens before remove_split)
+            # update snapshot after the current event finishes
+            QTimer.singleShot(0, self._deferred_splits_snapshot_update)
+        self._refresh_split_list()
+
+    def _deferred_splits_snapshot_update(self) -> None:
+        self._splits_snapshot = list(self.timeline.split_points())
+
+    # ── Undo / Redo ────────────────────────────────────────────────────────── #
+
+    def _push_undo_state_from_snapshot(self) -> None:
+        """Push the current snapshot (pre-operation state) onto the undo stack."""
+        self._undo_stack.append((list(self._splits_snapshot), set(self._excluded_segs)))
+        self._redo_stack.clear()
+        if len(self._undo_stack) > 50:
+            self._undo_stack.pop(0)
+
+    def _apply_state(self, splits: list, excluded: set) -> None:
+        """Restore a (splits, excluded) snapshot without touching either undo stack."""
+        self.timeline.clear_splits()
+        for ms in sorted(splits):
+            self.timeline.add_split(ms)
+        self._excluded_segs = set(excluded)
+        self.timeline.set_excluded(excluded)
+        n_total = len(splits) + 1
+        kept = n_total - len(excluded)
+        self._btn_join.setEnabled(bool(self._video_path) and kept > 0 and bool(excluded))
+        self._splits_snapshot = list(self.timeline.split_points())
+        self._refresh_split_list()
+
+    def _undo(self) -> None:
+        if not self._undo_stack:
+            self._status.showMessage("Nothing to undo")
+            return
+        self._redo_stack.append((list(self.timeline.split_points()), set(self._excluded_segs)))
+        self._apply_state(*self._undo_stack.pop())
+        self._status.showMessage("Undo")
+
+    def _redo(self) -> None:
+        if not self._redo_stack:
+            self._status.showMessage("Nothing to redo")
+            return
+        self._undo_stack.append((list(self.timeline.split_points()), set(self._excluded_segs)))
+        self._apply_state(*self._redo_stack.pop())
+        self._status.showMessage("Redo")
 
     def _add_split_here(self) -> None:
         if not self._video_path:
             return
         pos = self.player.position()
         if 0 < pos < self._duration:
+            self._push_undo_state_from_snapshot()
             self.timeline.add_split(pos)
+            self._splits_snapshot = list(self.timeline.split_points())
             self._refresh_split_list()
 
     def _auto_split_intervals(self) -> None:
         """Add split points at regular time intervals across the entire video."""
         if not self._duration:
             return
+        self._push_undo_state_from_snapshot()
         interval_ms = self._split_interval_sp.value() * 1000
         t = interval_ms
         added = 0
@@ -555,6 +626,7 @@ class MainWindow(QMainWindow):
             added += 1
             t += interval_ms
         if added:
+            self._splits_snapshot = list(self.timeline.split_points())
             self._refresh_split_list()
         self._status.showMessage(
             f"Added {added} cut point(s) every {self._split_interval_sp.value()}s"
@@ -564,10 +636,13 @@ class MainWindow(QMainWindow):
         row = self._split_list.currentRow()
         splits = self.timeline.split_points()
         if 0 <= row < len(splits):
+            self._push_undo_state_from_snapshot()
             self.timeline.remove_split(row)
+            self._splits_snapshot = list(self.timeline.split_points())
             self._refresh_split_list()
 
     def _on_segment_toggled(self, idx: int, excluded: bool) -> None:
+        self._push_undo_state_from_snapshot()
         if excluded:
             self._excluded_segs.add(idx)
         else:
@@ -696,6 +771,9 @@ class MainWindow(QMainWindow):
         self._video_path = path
         self._excluded_segs.clear()
         self._btn_join.setEnabled(False)
+        self._undo_stack.clear()
+        self._redo_stack.clear()
+        self._splits_snapshot = []
         self.player.load(path)
         self.player.play()
         self.player.set_subtitle_rows([])          # clear previous overlay
@@ -885,6 +963,7 @@ class MainWindow(QMainWindow):
                 "noise threshold (edit video_processor.py: noise_threshold).",
             )
             return
+        self._push_undo_state_from_snapshot()
         added = 0
         for start_s, end_s in silences:
             mid_ms = int((start_s + end_s) / 2.0 * 1000)
@@ -892,6 +971,7 @@ class MainWindow(QMainWindow):
                 self.timeline.add_split(mid_ms)
                 added += 1
         if added:
+            self._splits_snapshot = list(self.timeline.split_points())
             self._refresh_split_list()
         self._status.showMessage(
             f"Found {len(silences)} silent region(s) — added {added} cut point(s)"

@@ -85,6 +85,7 @@ class TimelineWidget(QWidget):
     overlay_moved    = pyqtSignal(int, int, int)  # row, new_start_ms, new_end_ms
     segment_toggled  = pyqtSignal(int, bool)       # seg_index, is_excluded
     clip_reordered   = pyqtSignal(list)             # new clip order [source_idx, ...]
+    zoom_changed     = pyqtSignal(float)            # new zoom level (1.0 = fit-all)
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -165,6 +166,26 @@ class TimelineWidget(QWidget):
 
     def set_clip_order(self, order: list[int]) -> None:
         self._clip_order = list(order)
+        self.update()
+
+    def zoom(self) -> float:
+        return self._zoom
+
+    def set_zoom(self, zoom: float, center_ms: int = -1) -> None:
+        """Set zoom level (1.0 = full view, 20.0 = max). Optionally anchor on center_ms."""
+        zoom = max(1.0, min(20.0, zoom))
+        if self._duration <= 0 or zoom == self._zoom:
+            return
+        v_s, v_e = self._visible_range()
+        if center_ms < 0:
+            center_ms = (v_s + v_e) // 2
+        old_vis = self._duration / self._zoom
+        new_vis = self._duration / zoom
+        ratio   = (center_ms - self._zoom_start) / old_vis if old_vis > 0 else 0.5
+        new_start = int(center_ms - ratio * new_vis)
+        self._zoom = zoom
+        self._zoom_start = max(0, min(max(0, self._duration - int(new_vis)), new_start))
+        self.zoom_changed.emit(zoom)
         self.update()
 
     # ── Coordinate helpers ────────────────────────────────────────────── #
@@ -323,6 +344,23 @@ class TimelineWidget(QWidget):
                     p.setPen(QPen(_C_RULER_TXT, 1))
                     p.drawText(lx, ruler_y + _RULER_H - 6, lbl)
             t += interval
+
+        # Zoom level badge (top-right of ruler, visible when zoomed in)
+        if self._zoom > 1.01:
+            zoom_lbl = f"{self._zoom:.1f}×" if self._zoom % 1 >= 0.05 else f"{int(self._zoom)}×"
+            zf = QFont()
+            zf.setPointSize(7)
+            p.setFont(zf)
+            zfm = QFontMetrics(zf)
+            zw  = zfm.horizontalAdvance(zoom_lbl) + 8
+            zh  = _RULER_H - 4
+            zx  = w - zw - 4
+            zy  = ruler_y + 2
+            p.setBrush(QBrush(QColor(255, 200, 50, 200)))
+            p.setPen(Qt.PenStyle.NoPen)
+            p.drawRoundedRect(zx, zy, zw, zh, 3, 3)
+            p.setPen(QPen(QColor(20, 16, 0), 1))
+            p.drawText(zx, zy, zw, zh, Qt.AlignmentFlag.AlignCenter, zoom_lbl)
 
         # ── Video track ──────────────────────────────────────────────── #
         vt_rect = QRect(_HEADER_W, _VIDEO_Y, self._cw(), _VIDEO_H)
@@ -716,6 +754,7 @@ class TimelineWidget(QWidget):
                 max_start = max(0, self._duration - int(new_vis))
                 self._zoom       = new_z
                 self._zoom_start = max(0, min(max_start, new_start))
+                self.zoom_changed.emit(self._zoom)
                 self.update()
             event.accept()
         elif self._zoom > 1.0:
@@ -732,6 +771,7 @@ class TimelineWidget(QWidget):
         if event.button() == Qt.MouseButton.LeftButton:
             self._zoom       = 1.0
             self._zoom_start = 0
+            self.zoom_changed.emit(1.0)
             self.update()
             event.accept()
         else:

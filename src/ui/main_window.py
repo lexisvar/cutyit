@@ -5,7 +5,7 @@ from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QSplitter, QVBoxLayout, QHBoxLayout,
     QToolBar, QFileDialog, QMessageBox, QListWidget, QComboBox,
     QPushButton, QLabel, QTabWidget, QStatusBar, QSizePolicy, QFrame,
-    QSpinBox, QProgressBar, QScrollArea,
+    QSpinBox, QProgressBar, QScrollArea, QSlider,
 )
 from PyQt6.QtCore import Qt, QThread, QDir, pyqtSignal, QTimer
 from PyQt6.QtGui import QAction, QKeySequence, QShortcut
@@ -238,6 +238,44 @@ class MainWindow(QMainWindow):
         self.timeline = TimelineWidget()
         left_layout.addWidget(self.timeline)
 
+        # ── Zoom bar ────────────────────────────────────────────────── #
+        zoom_row = QHBoxLayout()
+        zoom_row.setContentsMargins(44, 0, 4, 0)   # align with timeline content (past header)
+        zoom_row.setSpacing(4)
+
+        self._btn_zoom_out = QPushButton("−")
+        self._btn_zoom_out.setFixedSize(20, 16)
+        self._btn_zoom_out.setToolTip("Zoom out")
+        self._btn_zoom_out.setStyleSheet("QPushButton { font-size:13px; padding:0; }")
+
+        self._zoom_slider = QSlider(Qt.Orientation.Horizontal)
+        self._zoom_slider.setRange(10, 200)   # /10 → 1.0× … 20.0×
+        self._zoom_slider.setValue(10)
+        self._zoom_slider.setFixedHeight(16)
+        self._zoom_slider.setToolTip("Timeline zoom  (or ⌘+Scroll on the timeline)")
+
+        self._btn_zoom_in = QPushButton("+")
+        self._btn_zoom_in.setFixedSize(20, 16)
+        self._btn_zoom_in.setToolTip("Zoom in")
+        self._btn_zoom_in.setStyleSheet("QPushButton { font-size:13px; padding:0; }")
+
+        self._zoom_lbl = QLabel("1×")
+        self._zoom_lbl.setFixedWidth(36)
+        self._zoom_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._zoom_lbl.setStyleSheet("color: #8c96a5; font-size: 11px;")
+
+        self._btn_zoom_reset = QPushButton("↺")
+        self._btn_zoom_reset.setFixedSize(20, 16)
+        self._btn_zoom_reset.setToolTip("Reset zoom (or double-click timeline)")
+        self._btn_zoom_reset.setStyleSheet("QPushButton { font-size:12px; padding:0; }")
+
+        zoom_row.addWidget(self._btn_zoom_out)
+        zoom_row.addWidget(self._zoom_slider, 1)
+        zoom_row.addWidget(self._btn_zoom_in)
+        zoom_row.addWidget(self._zoom_lbl)
+        zoom_row.addWidget(self._btn_zoom_reset)
+        left_layout.addLayout(zoom_row)
+
         h_split.addWidget(left)
 
         # Right panel
@@ -463,6 +501,15 @@ class MainWindow(QMainWindow):
         self.timeline.subtitle_moved.connect(self.subtitle_editor.on_subtitle_moved)
         self.timeline.segment_toggled.connect(self._on_segment_toggled)
         self.timeline.clip_reordered.connect(self._on_clip_reordered)
+
+        # Zoom bar
+        self._zoom_slider.valueChanged.connect(self._on_zoom_slider)
+        self._btn_zoom_in.clicked.connect(
+            lambda: self.timeline.set_zoom(self.timeline.zoom() * 1.5))
+        self._btn_zoom_out.clicked.connect(
+            lambda: self.timeline.set_zoom(self.timeline.zoom() / 1.5))
+        self._btn_zoom_reset.clicked.connect(lambda: self.timeline.set_zoom(1.0))
+        self.timeline.zoom_changed.connect(self._on_zoom_changed)
 
         # Overlay panel ↔ timeline
         self.overlay_panel.overlays_changed.connect(self.timeline.set_overlay_rows)
@@ -695,6 +742,16 @@ class MainWindow(QMainWindow):
         self._btn_join.setEnabled(
             bool(self._video_path) and kept > 0 and bool(self._excluded_segs)
         )
+
+    def _on_zoom_slider(self, value: int) -> None:
+        self.timeline.set_zoom(value / 10.0)
+
+    def _on_zoom_changed(self, zoom: float) -> None:
+        self._zoom_slider.blockSignals(True)
+        self._zoom_slider.setValue(round(zoom * 10))
+        self._zoom_slider.blockSignals(False)
+        z = round(zoom, 1)
+        self._zoom_lbl.setText(f"{int(z)}×" if z == int(z) else f"{z}×")
 
     def _on_clip_reordered(self, order: list[int]) -> None:
         """Timeline drag-to-reorder finished — update clip order and enable join."""

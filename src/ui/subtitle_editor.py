@@ -9,7 +9,7 @@ from PyQt6.QtWidgets import (
     QProgressBar, QFileDialog, QMessageBox, QHeaderView,
     QAbstractItemView, QFrame, QLineEdit, QStyledItemDelegate,
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSettings
 from PyQt6.QtGui import QColor
 
 from src.ui.subtitle_style import SubtitleStyleWidget, build_ass_content
@@ -213,6 +213,67 @@ class _LiveDelegate(QStyledItemDelegate):
 
 
 # --------------------------------------------------------------------------- #
+#  Translation worker                                                          #
+# --------------------------------------------------------------------------- #
+
+# ISO-639-1 codes for the languages shown in the UI
+_LANG_CODES: dict[str, str] = {
+    "Spanish":             "es",
+    "French":              "fr",
+    "German":              "de",
+    "Italian":             "it",
+    "Portuguese":          "pt",
+    "Dutch":               "nl",
+    "Russian":             "ru",
+    "Japanese":            "ja",
+    "Chinese Simplified":  "zh",
+    "Korean":              "ko",
+    "Arabic":              "ar",
+    "Turkish":             "tr",
+    "Polish":              "pl",
+    "Ukrainian":           "uk",
+    "Hindi":               "hi",
+    "Swedish":             "sv",
+    "Norwegian":           "nb",
+    "Danish":              "da",
+    "Finnish":             "fi",
+}
+
+
+class _TranslateWorker(QThread):
+    finished = pyqtSignal(list)       # translated texts (same length as input)
+    error    = pyqtSignal(str)
+    progress = pyqtSignal(int, int)   # done, total
+
+    def __init__(
+        self,
+        texts: list[str],
+        backend: str,           # "openai" | "argos"
+        target_lang: str,       # e.g. "es"
+        api_key: str = "",
+        source_lang: str = "en",
+    ) -> None:
+        super().__init__()
+        self._texts       = texts
+        self._backend     = backend
+        self._target_lang = target_lang
+        self._api_key     = api_key
+        self._source_lang = source_lang
+
+    def run(self) -> None:
+        from src.core.translator import translate_openai, translate_argos  # noqa: PLC0415
+        try:
+            cb = lambda d, t: self.progress.emit(d, t)  # noqa: E731
+            if self._backend == "openai":
+                out = translate_openai(self._texts, self._target_lang, self._api_key, cb)
+            else:
+                out = translate_argos(self._texts, self._target_lang, self._source_lang, cb)
+            self.finished.emit(out)
+        except Exception as exc:
+            self.error.emit(str(exc))
+
+
+# --------------------------------------------------------------------------- #
 #  Widget                                                                      #
 # --------------------------------------------------------------------------- #
 
@@ -234,13 +295,16 @@ class SubtitleEditorWidget(QWidget):
         super().__init__(parent)
         self._video_path: str | None = None
         self._worker: _TranscribeWorker | None = None
+        self._translate_worker: _TranslateWorker | None = None
         self._segments_info: list[tuple[int, int, str]] = []
         self._drag_offset_playres: tuple[float, float] = (0.0, 0.0)
         self._word_rows: list[list[tuple[int, int, str]]] = []
         self._video_native_size: tuple[int, int] = (1920, 1080)  # updated when video loads
         self._populating: bool = False
+        self._settings = QSettings("lexisvar", "cutyit")
         self._build_ui()
         self._style_panel.hide()   # collapsed by default; toggled by _style_toggle
+        self._translate_panel.hide()
 
     # ------------------------------------------------------------------ #
     #  UI                                                                  #
@@ -431,6 +495,76 @@ class SubtitleEditorWidget(QWidget):
         export_row.addWidget(self._btn_pgn)
         layout.addLayout(export_row)
 
+        # ── Translation section ───────────────────────────────────────── #
+        self._translate_toggle = QPushButton("▶  Translate")
+        self._translate_toggle.setCheckable(True)
+        self._translate_toggle.setFixedHeight(26)
+        self._translate_toggle.setStyleSheet(
+            "QPushButton { text-align: left; padding: 4px 8px;"
+            "  background: #1c2a3a; border: 1px solid #3a9a7a;"
+            "  border-radius: 4px; color: #3a9a7a; font-weight: bold; font-size: 11px; }"
+            "QPushButton:checked { background: #1a3a2a; }"
+            "QPushButton:hover { background: #1e3030; }"
+        )
+        layout.addWidget(self._translate_toggle)
+
+        self._translate_panel = QFrame()
+        self._translate_panel.setStyleSheet(
+            "QFrame { border: 1px solid #2a4a3a; border-radius: 4px; background: #111a14; }"
+        )
+        tr_lay = QVBoxLayout(self._translate_panel)
+        tr_lay.setContentsMargins(6, 6, 6, 6)
+        tr_lay.setSpacing(4)
+
+        # Row 1: backend + target language
+        r1 = QHBoxLayout()
+        r1.setSpacing(4)
+        r1.addWidget(QLabel("Backend:"))
+        self._trans_backend_cb = QComboBox()
+        self._trans_backend_cb.addItems(["OpenAI (gpt-4o-mini)", "Local (Argos)"])
+        r1.addWidget(self._trans_backend_cb)
+        r1.addWidget(QLabel("To:"))
+        self._trans_lang_cb = QComboBox()
+        for name in _LANG_CODES:
+            self._trans_lang_cb.addItem(name)
+        r1.addWidget(self._trans_lang_cb, 1)
+        tr_lay.addLayout(r1)
+
+        # Row 2: API key (OpenAI only)
+        self._api_key_frame = QFrame()
+        self._api_key_frame.setStyleSheet("QFrame { border: none; background: transparent; }")
+        ak = QHBoxLayout(self._api_key_frame)
+        ak.setContentsMargins(0, 0, 0, 0)
+        ak.setSpacing(4)
+        ak.addWidget(QLabel("API Key:"))
+        self._trans_apikey_le = QLineEdit()
+        self._trans_apikey_le.setPlaceholderText("sk-…  (saved locally in settings)")
+        self._trans_apikey_le.setEchoMode(QLineEdit.EchoMode.Password)
+        self._trans_apikey_le.setText(self._settings.value("openai/api_key", ""))
+        ak.addWidget(self._trans_apikey_le, 1)
+        self._btn_save_apikey = QPushButton("Save")
+        self._btn_save_apikey.setFixedSize(44, 24)
+        ak.addWidget(self._btn_save_apikey)
+        tr_lay.addWidget(self._api_key_frame)
+
+        # Row 3: translate button + progress
+        r3 = QHBoxLayout()
+        r3.setSpacing(4)
+        self._btn_translate = QPushButton("Translate")
+        self._btn_translate.setEnabled(False)
+        self._btn_translate.setFixedHeight(26)
+        r3.addWidget(self._btn_translate)
+        self._trans_progress = QProgressBar()
+        self._trans_progress.setRange(0, 100)
+        self._trans_progress.setFixedHeight(14)
+        self._trans_progress.setTextVisible(True)
+        self._trans_progress.setFormat("%v / %m")
+        self._trans_progress.hide()
+        r3.addWidget(self._trans_progress, 1)
+        tr_lay.addLayout(r3)
+
+        layout.addWidget(self._translate_panel)
+
         # ── Connections ───────────────────────────────────────────────── #
         self._btn_generate.clicked.connect(self._start_generation)
         self._btn_chunk.clicked.connect(self._auto_chunk)
@@ -446,6 +580,17 @@ class SubtitleEditorWidget(QWidget):
         self._btn_embed.clicked.connect(lambda: self._do_export(burn_in=False))
         self._btn_burn.clicked.connect(lambda: self._do_export(burn_in=True))
         self._btn_pgn.clicked.connect(self._import_pgn)
+        self._translate_toggle.toggled.connect(self._translate_panel.setVisible)
+        self._translate_toggle.toggled.connect(
+            lambda on: self._translate_toggle.setText(
+                ("▼  Translate" if on else "▶  Translate")
+            )
+        )
+        self._trans_backend_cb.currentIndexChanged.connect(self._update_translate_ui)
+        self._trans_apikey_le.textChanged.connect(self._update_translate_btn)
+        self._btn_save_apikey.clicked.connect(self._save_api_key)
+        self._btn_translate.clicked.connect(self._start_translation)
+        self._update_translate_ui()
 
     # ------------------------------------------------------------------ #
     #  Style panel helpers                                                 #
@@ -536,6 +681,79 @@ class SubtitleEditorWidget(QWidget):
         self._btn_embed.setEnabled(has)
         self._btn_burn.setEnabled(has)
         self._btn_chunk.setEnabled(has)
+
+    # ------------------------------------------------------------------ #
+    #  Translation                                                         #
+    # ------------------------------------------------------------------ #
+
+    def _update_translate_ui(self) -> None:
+        """Show/hide API key row depending on selected backend."""
+        is_openai = self._trans_backend_cb.currentIndex() == 0
+        self._api_key_frame.setVisible(is_openai)
+        self._update_translate_btn()
+
+    def _update_translate_btn(self) -> None:
+        has_rows   = self._table.rowCount() > 0
+        is_openai  = self._trans_backend_cb.currentIndex() == 0
+        key_ok     = bool(self._trans_apikey_le.text().strip()) if is_openai else True
+        busy       = (self._translate_worker is not None
+                      and self._translate_worker.isRunning())
+        self._btn_translate.setEnabled(has_rows and key_ok and not busy)
+
+    def _save_api_key(self) -> None:
+        key = self._trans_apikey_le.text().strip()
+        self._settings.setValue("openai/api_key", key)
+        self._btn_save_apikey.setText("Saved ✓")
+        QTimer_single = __import__("PyQt6.QtCore", fromlist=["QTimer"]).QTimer
+        QTimer_single.singleShot(1500, lambda: self._btn_save_apikey.setText("Save"))
+
+    def _start_translation(self) -> None:
+        rows = self._read_table_rows()
+        if not rows:
+            return
+        texts       = [r[2] for r in rows]
+        is_openai   = self._trans_backend_cb.currentIndex() == 0
+        backend     = "openai" if is_openai else "argos"
+        lang_name   = self._trans_lang_cb.currentText()
+        target_code = _LANG_CODES.get(lang_name, "es")
+        api_key     = self._trans_apikey_le.text().strip() if is_openai else ""
+
+        # Source language: use the transcription language setting
+        src_raw     = self._lang_cb.currentText()
+        source_code = src_raw if src_raw != "Auto" else "en"
+
+        self._translate_worker = _TranslateWorker(
+            texts, backend, target_code, api_key, source_code
+        )
+        self._translate_worker.progress.connect(self._on_translate_progress)
+        self._translate_worker.finished.connect(self._on_translate_done)
+        self._translate_worker.error.connect(self._on_translate_error)
+
+        self._trans_progress.setRange(0, len(texts))
+        self._trans_progress.setValue(0)
+        self._trans_progress.show()
+        self._btn_translate.setEnabled(False)
+        self._btn_translate.setText("Translating…")
+        self._translate_worker.start()
+
+    def _on_translate_progress(self, done: int, total: int) -> None:
+        self._trans_progress.setRange(0, total)
+        self._trans_progress.setValue(done)
+
+    def _on_translate_done(self, translated: list[str]) -> None:
+        rows = self._read_table_rows()
+        new_rows = [(s, e, t) for (s, e, _), t in zip(rows, translated)]
+        self._populate_table(new_rows)
+        self.subtitles_updated.emit(new_rows)
+        self._trans_progress.hide()
+        self._btn_translate.setText("Translate")
+        self._update_translate_btn()
+
+    def _on_translate_error(self, msg: str) -> None:
+        self._trans_progress.hide()
+        self._btn_translate.setText("Translate")
+        self._update_translate_btn()
+        QMessageBox.critical(self, "Translation Error", msg)
 
     # ------------------------------------------------------------------ #
     #  Generation                                                          #
@@ -646,6 +864,7 @@ class SubtitleEditorWidget(QWidget):
 
         self._table.blockSignals(False)
         self._populating = False
+        self._update_translate_btn()
 
     def _read_table_rows(self) -> list[tuple]:
         rows = []

@@ -918,6 +918,7 @@ class MainWindow(QMainWindow):
     def _save_project(self) -> None:
         if not self._video_path:
             return
+        import dataclasses  # noqa: PLC0415
         default = os.path.splitext(self._video_path)[0] + ".cyt"
         path, _ = QFileDialog.getSaveFileName(
             self, "Save Project", default,
@@ -926,8 +927,10 @@ class MainWindow(QMainWindow):
         )
         if not path:
             return
-        subs = self.subtitle_editor.get_subtitle_rows()
+        subs     = self.subtitle_editor.get_subtitle_rows()
         overlays = self.overlay_panel.get_overlays()
+        style    = self.subtitle_editor._style_panel.current_style()
+        drag     = self.subtitle_editor.get_drag_offset()
         data = {
             "version": "1",
             "video_path": self._video_path,
@@ -940,6 +943,8 @@ class MainWindow(QMainWindow):
             "overlays": [
                 {"start_ms": s, "end_ms": e, "path": p} for s, e, p in overlays
             ],
+            "subtitle_style": dataclasses.asdict(style),
+            "subtitle_drag_offset": list(drag),
         }
         try:
             with open(path, "w", encoding="utf-8") as f:
@@ -988,11 +993,23 @@ class MainWindow(QMainWindow):
                         and self._clip_order != list(range(len(self._clip_order))))
         self._btn_join.setEnabled(bool(self._excluded_segs) or is_reordered)
 
+        # Subtitle style + animation must be restored BEFORE loading rows so
+        # the live preview immediately renders with the correct appearance.
+        style_data = data.get("subtitle_style")
+        if style_data:
+            self.subtitle_editor.load_style(style_data)
+
         subs = data.get("subtitles", [])
         if subs:
             rows = [(s["start_ms"], s["end_ms"], s["text"]) for s in subs]
             self.subtitle_editor.load_subtitle_rows(rows)
             self.player.set_subtitle_rows(rows)
+
+        # Restore subtitle drag / position offset
+        drag = data.get("subtitle_drag_offset", [0.0, 0.0])
+        if drag and (drag[0] != 0.0 or drag[1] != 0.0):
+            self.subtitle_editor.set_drag_offset(drag[0], drag[1])
+            self.player.restore_subtitle_drag_offset(drag[0], drag[1])
 
         overlays = data.get("overlays", [])
         if overlays:

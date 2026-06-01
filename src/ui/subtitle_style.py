@@ -945,3 +945,12 @@ class SubtitleStyleWidget(QWidget):
             if card._selected:
                 return name
         return "Custom"
+
+    def load_style(self, style: SubtitleStyle) -> None:
+        """Restore a saved SubtitleStyle, updating all UI controls."""
+        self._style = style.clone()
+        self._load_to_ui()
+        # Highlight the matching preset card (if any)
+        for n, card in self._cards.items():
+            card.set_selected(n == style.name)
+        self.style_changed.emit(self._style.clone())

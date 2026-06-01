@@ -664,6 +664,28 @@ class SubtitleEditorWidget(QWidget):
         self._scope_cb.setCurrentIndex(idx)
         self._scope_cb.blockSignals(False)
 
+    def get_drag_offset(self) -> tuple[float, float]:
+        """Return the current subtitle drag offset in PlayRes (1920×1080) units."""
+        return self._drag_offset_playres
+
+    def load_style(self, style_dict: dict) -> None:
+        """Restore a saved SubtitleStyle from its serialised dict."""
+        from src.ui.subtitle_style import SubtitleStyle  # noqa: PLC0415
+        # dataclasses.asdict converts tuples to lists; convert back
+        _color_fields = ("primary_color", "outline_color", "back_color", "highlight_color")
+        d = dict(style_dict)
+        for field in _color_fields:
+            if field in d and isinstance(d[field], list):
+                d[field] = tuple(d[field])
+        try:
+            style = SubtitleStyle(**d)
+            self._style_panel.load_style(style)
+            preset = self._style_panel.active_preset_name()
+            arrow = "▼" if self._style_toggle.isChecked() else "▶"
+            self._style_toggle.setText(f"{arrow}   Style: {preset}")
+        except Exception:
+            pass
+
     def get_subtitle_rows(self) -> list[tuple]:
         """Return current subtitle rows as [(start_ms, end_ms, text), ...]."""
         if self._table.rowCount() == 0:

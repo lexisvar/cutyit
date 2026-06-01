@@ -719,6 +719,18 @@ class SubtitleOverlayPlayer(QWidget):
         # If rows are already loaded, force a repaint with the new style
         self._sub_item.update()
 
+    def restore_subtitle_drag_offset(self, dx_playres: float, dy_playres: float) -> None:
+        """Restore a saved subtitle drag offset (PlayRes 1920×1080 units)."""
+        from PyQt6.QtCore import QPointF  # noqa: PLC0415
+        sw = self._sub_item._scene_w
+        sh = self._sub_item._scene_h
+        if sw > 0 and sh > 0:
+            self._sub_item._drag_offset = QPointF(
+                dx_playres * (sw / 1920.0),
+                dy_playres * (sh / 1080.0),
+            )
+            self._sub_item.update()
+
     def _on_sub_drag_end(self, dx_scene: float, dy_scene: float) -> None:
         """Convert scene-pixel drag offset to PlayRes (1920×1080) units and emit.
 

@@ -984,7 +984,6 @@ class SubtitleEditorWidget(QWidget):
         )
         path, _ = QFileDialog.getSaveFileName(
             self, "Save SRT", default, "SRT Files (*.srt)",
-            options=QFileDialog.Option.DontUseNativeDialog,
         )
         if path:
             with open(path, "w", encoding="utf-8") as fh:
@@ -1271,7 +1270,6 @@ class SubtitleEditorWidget(QWidget):
         )
         path, _ = QFileDialog.getSaveFileName(
             self, "Save WebVTT", default, "WebVTT Files (*.vtt)",
-            options=QFileDialog.Option.DontUseNativeDialog,
         )
         if path:
             with open(path, "w", encoding="utf-8") as fh:
@@ -1312,7 +1310,6 @@ class SubtitleEditorWidget(QWidget):
         path, _ = QFileDialog.getOpenFileName(
             self, "Open PGN File", "",
             "PGN Files (*.pgn);;All Files (*)",
-            options=QFileDialog.Option.DontUseNativeDialog,
         )
         if not path:
             return

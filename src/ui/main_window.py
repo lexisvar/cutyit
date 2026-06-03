@@ -786,7 +786,6 @@ class MainWindow(QMainWindow):
         out_path, _ = QFileDialog.getSaveFileName(
             self, "Save Joined Video", f"{base}_joined.mp4",
             "MP4 Files (*.mp4);;All Files (*)",
-            options=QFileDialog.Option.DontUseNativeDialog,
         )
         if not out_path:
             return
@@ -867,7 +866,6 @@ class MainWindow(QMainWindow):
             "Open Video",
             QDir.homePath(),
             "Video Files (*.mp4 *.mov *.mkv *.avi *.webm *.m4v *.flv *.wmv *.ts);;All Files (*)",
-            options=QFileDialog.Option.DontUseNativeDialog,
         )
         if not path:
             return
@@ -923,7 +921,6 @@ class MainWindow(QMainWindow):
         path, _ = QFileDialog.getSaveFileName(
             self, "Save Project", default,
             "Cutyit Project (*.cyt);;All Files (*)",
-            options=QFileDialog.Option.DontUseNativeDialog,
         )
         if not path:
             return
@@ -957,7 +954,6 @@ class MainWindow(QMainWindow):
         path, _ = QFileDialog.getOpenFileName(
             self, "Open Project", QDir.homePath(),
             "Cutyit Project (*.cyt);;All Files (*)",
-            options=QFileDialog.Option.DontUseNativeDialog,
         )
         if not path:
             return
@@ -1041,7 +1037,6 @@ class MainWindow(QMainWindow):
             return
         out_dir = QFileDialog.getExistingDirectory(
             self, "Select Output Folder", os.path.dirname(self._video_path),
-            options=QFileDialog.Option.DontUseNativeDialog,
         )
         if not out_dir:
             return
@@ -1094,7 +1089,6 @@ class MainWindow(QMainWindow):
             "Save Video with Subtitles",
             stem + suffix + ext,
             f"Video (*{ext})",
-            options=QFileDialog.Option.DontUseNativeDialog,
         )
         if not output_path:
             os.unlink(srt_path)
@@ -1142,7 +1136,6 @@ class MainWindow(QMainWindow):
             f"Export for {platform}",
             f"{stem}_{platform.lower()}_1080x1920.mp4",
             "Video Files (*.mp4)",
-            options=QFileDialog.Option.DontUseNativeDialog,
         )
         if not output_path:
             return
@@ -1248,7 +1241,7 @@ class MainWindow(QMainWindow):
             QLabel#lbl_filename { color: #c9d1d9; font-weight: bold; font-size: 12px; }
             QLabel#lbl_meta {
                 color: #8b949e; font-size: 11px;
-                font-family: 'SF Mono', 'Menlo', monospace;
+                font-family: 'Menlo', 'Monaco', monospace;
             }
             QSplitter::handle { background: #21262d; }
             QSplitter::handle:horizontal { width: 1px; }
@@ -1266,7 +1259,7 @@ class MainWindow(QMainWindow):
             QTabBar::tab:hover:!selected { color: #c9d1d9; background: #21262d; }
             QWidget#player_controls { background: #0d1117; }
             QLabel#lbl_timecode {
-                color: #8b949e; font-family: 'SF Mono', 'Menlo', monospace; font-size: 11px;
+                color: #8b949e; font-family: 'Menlo', 'Monaco', monospace; font-size: 11px;
             }
             QLabel#sub_preview_badge {
                 background: #1f6feb; color: #ffffff;
